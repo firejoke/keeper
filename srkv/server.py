@@ -647,12 +647,13 @@ class Node(Server):
         初始化时，先从数据库读取保存的事务日志。
 
         顺序获取每一条事务，
-        状态为 failed 的事务直接跳过，
+        状态为 failed 和 committed 的事务直接跳过，
         状态为 ready 的事务，
          如果该节点是follower节点，则一直等待 leader 节点通知该事务可以执行，
          如果是leader节点则先同步该事务到 follower 节点，同步超过一半后，
-         更改该事务状态为committed，再通知follower节点变更该事务状态。
-        状态为 committed 的事务直接执行。
+         更改该事务状态为doing。
+        状态为 doing 的事务直接执行该事务，并更改该事务状态为 committed。
+         如果该节点为leader节点则通知follower节点更新该事务的状态为doing。
         """
         logger.info("watch kv")
         sync_votes = (len(self.remote_nodes.keys()) + 1) / 2.0
