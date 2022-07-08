@@ -1,0 +1,28 @@
+supervisory:
+ alter_key: null
+ logging:
+  level: debug
+  dir: /var/log/supervisory/
+  when: W0
+  backupCount: 6
+ procs: []
+ #  - name: module name
+ #    reload_max: 10
+ #    require: require module name
+
+srkv:
+ heartbeat: 0.15
+ port: 9050
+ timeout: 1
+ scan: true
+
+protect_document:
+ documents: []
+#   - /etc/libvirt/qemu/xxxx.xml
+
+watcher_galera:
+ mariadb:
+  host: 127.0.0.1
+  user: root
+  pd: admin
+  port: 3306
