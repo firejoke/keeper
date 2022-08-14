@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 # Author      : ShiFan
 # Created Date: 2022/6/1 16:00
-from public_def import RpcClient, SRkvLocalSock
+from public_def import CONF, RpcClient, SRkvLocalSock
 
 
 class API(object):
     def __init__(self):
-        self.rpc_client = RpcClient()
+        conf = CONF.get(__package__)
+        heartbeat = conf.get("heartbeat", 150 * (10 ** -3))
+        timeout = conf.get("timeout", 1)
+        self.rpc_client = RpcClient(heartbeat=heartbeat, timeout=timeout)
         self.rpc_client.connect("ipc://%s" % SRkvLocalSock)
 
     def info(self):
@@ -23,3 +26,6 @@ class API(object):
 
     def get_kv(self, key):
         return self.rpc_client.get_kv(key)
+
+    def close(self):
+        self.rpc_client.close()

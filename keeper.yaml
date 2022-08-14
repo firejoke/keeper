@@ -2,19 +2,21 @@ keeper:
  alter_key: null
  logging:
   level: debug
-  dir: /var/log/supervisory/
+  dir: /var/log/keeper/
   when: W0
   backupCount: 6
  procs: []
- #  - name: module name
- #    reload_max: 10
- #    require: require module name
+#  - name: module name
+#    reload_max: 10
+#    requires:
+#     - require module name
 
 srkv:
  heartbeat: 0.15
- port: 9050
+ port: 5656
  timeout: 1
  scan: true
+ remote_nodes: []
 
 protect_document:
  documents: []

@@ -128,7 +128,6 @@ class Node(Server):
         self.remote_nodes = dict()
         self.join_nodes = list()
         self._db_session = Session()
-        self._task_daemon = None
         self.repository = dict()
         self._repository_ready = False
         self.repository_transaction = OrderedDict()
@@ -137,7 +136,9 @@ class Node(Server):
         self._repository_transaction_ready = False
         self._repository_transaction_event = gEvent()
         self._repository_transaction_daemon = None
+        self._repository_transaction_daemon_exit = 0
         self._cluster_daemon = None
+        self._cluster_daemon_exit = 0
         Server.__init__(self, heartbeat=self.heartbeat)
         try:
 
@@ -395,11 +396,13 @@ class Node(Server):
             Nodes.sys_uid, Nodes.ipaddresses).all()
         exists_uid = []
         exists_ips = []
+        logger.debug("exists nodes: %s" % exists_nodes)
         for n in exists_nodes:
             exists_uid.append(n[0])
             exists_ips += json.loads(n[1])
 
         for ipaddress in get_local_interfaces():
+            logger.debug("ipaddress: %s" % ipaddress)
             for ip in scan_port(
                     ipaddress["addr"], ipaddress["netmask"], self.rpc_port
             ):
@@ -439,6 +442,8 @@ class Node(Server):
                             "write node(%s) to database failed: %s" %
                             (info["sys_uid"], e)
                         )
+        else:
+            logger.info("The scan is complete.")
 
     def _create_to_repository(self, key, value):
         self.repository[key] = value
@@ -541,12 +546,17 @@ class Node(Server):
     @check_repository_ready
     @check_params
     @encrypt_result
-    def get_kv(self, key):
+    def get_kv(self, key, prefix=False):
         if self.role == 1:
             RuntimeError("Node is not ready")
         elif self.role == 2:
-            return self._leader.get_kv(key)
+            return self._leader.get_kv(key, prefix=prefix)
         else:
+            if prefix:
+                return {
+                    _key: self.repository[_key] for _key in self.repository
+                    if _key.startswith(key)
+                }
             return self.repository[key]
 
     @check_transaction_ready
@@ -588,9 +598,11 @@ class Node(Server):
     def _update_transaction(self, **transaction):
         try:
             ac = self._db_session.query(Transaction).get(transaction["id"])
+            logger.debug("update transaction, old:\n%s" % ac.__dict__)
             for key, value in transaction.items():
                 if getattr(ac, key) != value:
                     setattr(ac, key, value)
+            logger.debug("new:\n%s" % ac.__dict__)
             self._db_session.commit()
             self.repository_transaction[transaction["id"]] = transaction
             self._repository_transaction_event.set()
@@ -647,7 +659,7 @@ class Node(Server):
         初始化时，先从数据库读取保存的事务日志。
 
         顺序获取每一条事务，
-        状态为 failed 和 committed 的事务直接跳过，
+        状态为 failed 的事务直接跳过，
         状态为 ready 的事务，
          如果该节点是follower节点，则一直等待 leader 节点通知该事务可以执行，
          如果是leader节点则先同步该事务到 follower 节点，同步超过一半后，
@@ -658,11 +670,15 @@ class Node(Server):
         logger.info("watch kv")
         sync_votes = (len(self.remote_nodes.keys()) + 1) / 2.0
         while 1:
+            if self._repository_transaction_daemon_exit:
+                logger.warning("repository transaction daemon exit.")
+                return
             self._repository_transaction_event.wait()
             try:
                 ac = deepcopy(
                     self.repository_transaction[self.repository_transaction_id]
                 )
+                logger.debug("transaction : %s" % ac)
             except KeyError:
                 self._repository_transaction_event.clear()
                 continue
@@ -711,7 +727,7 @@ class Node(Server):
             elif ac["state"] == "doing":
                 logger.info("Execute the transaction: \n%s" % ac)
                 ac["roll_value"] = self.repository.get(ac["key"], None)
-                if ac["value"]:
+                if "value" in ac:
                     args = (ac["key"], ac["value"])
                 else:
                     args = (ac["key"],)
@@ -720,8 +736,11 @@ class Node(Server):
                     ac["state"] = "committed"
                 except Exception as e:
                     ac["state"] = "failed"
-                    self._rollback_transaction(ac)
                     logger.error("Transaction execution failre: \n%s" % e)
+                    try:
+                        self._rollback_transaction(ac)
+                    except Exception as e:
+                        logger.error("Rollback transaction failre: \n%s" % e)
                 finally:
                     self._update_transaction(**ac)
 
@@ -741,8 +760,7 @@ class Node(Server):
                             if ac["state"] == "committed":
                                 ac["state"] = "doing"
                             rpc.update_transaction(**ac)
-                        except (LostRemote, RemoteError,
-                                TimeoutExpired) as e:
+                        except (LostRemote, RemoteError, TimeoutExpired) as e:
                             logger.error(
                                 "node(%s) failed to sync a transaction: "
                                 "\n%s" % (uid, e)
@@ -764,6 +782,9 @@ class Node(Server):
         logger.info("watch cluster")
         keepalive_g_stat = dict()
         while 1:
+            if self._cluster_daemon_exit:
+                logger.warning("cluster daemon exit.")
+                return
             if self.join_nodes:
                 self._task_pool.spawn(self._check_join_node)
 
@@ -810,6 +831,7 @@ class Node(Server):
                     # self.remote_nodes.pop(self.leader_uid)
 
     def run(self, ):
+        logger.debug("load transaction.")
         for ac in self._db_session.query(Transaction).order_by(
                 Transaction.id
         ).options(lazyload("*")):
@@ -824,8 +846,9 @@ class Node(Server):
                     "state": ac.state
                 }
             )
+            logger.debug("transaction: %s" % ac.__dict__)
             if ac.state == "committed":
-                if ac.value:
+                if hasattr(ac, "value"):
                     args = (ac.key, ac.value)
                 else:
                     args = (ac.key,)
@@ -834,8 +857,10 @@ class Node(Server):
             self._repository_transaction_ready = True
 
         try:
+            self._cluster_daemon_exit = 0
             self._cluster_daemon = spawn(self._watch_cluster)
             self._repository_transaction_daemon = spawn(self._watch_kv)
+            self._repository_transaction_daemon_exit = 0
             self._acceptor_task = spawn(self._acceptor)
             self._acceptor_task.get()
             self._cluster_daemon.get()
@@ -847,13 +872,16 @@ class Node(Server):
             self._task_pool.join(raise_error=True)
 
     def stop(self, ):
+        logger.debug("node server stop.")
+        if self._repository_transaction_daemon:
+            self._repository_transaction_daemon_exit = 1
+            self._repository_transaction_daemon.join()
+        if self._cluster_daemon:
+            self._cluster_daemon_exit = 1
+            self._cluster_daemon.join()
         if self._acceptor_task is not None:
             self._acceptor_task.kill()
             self._acceptor_task = None
-        if self._repository_transaction_daemon:
-            self._repository_transaction_daemon.kill()
-        if self._cluster_daemon:
-            self._cluster_daemon.kill()
 
 
 def proc():
@@ -867,6 +895,7 @@ def proc():
     def exit_proc(signum=None, frame=None):
         if os.getpid() == my_pid:
             logger.warning("server exit")
+            node.stop()
             node.close()
         return
 

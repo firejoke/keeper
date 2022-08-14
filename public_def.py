@@ -331,6 +331,16 @@ LOGGING = {
         },
     },
 }
+
+for proc in CONF["supervisory"].get("procs"):
+    LOGGING["handlers"][proc["name"]] = {
+        "level": __log_level,
+        "filename": os.path.join(__log_dir, "%s.log" % proc["name"])
+    }
+    LOGGING["loggers"][proc["name"]] = {
+        "handlers": [proc["name"]],
+        "level": __log_level
+    }
 __debug_file_handler_mixin = {
             "class": "logging.handlers.RotatingFileHandler",
             "maxBytes": 100 * 1024 * 1024,
@@ -533,6 +543,30 @@ def chmod(path, permission, join=True, recursion=False):
             )
 
 
+def read_hosts():
+    hs = OrderedDict()
+    if os.path.exists("/etc/hosts"):
+        with open("/etc/hosts") as f:
+            for h in f.readlines():
+                # _res = re.search(
+                #     r"%s\s+([a-zA-Z][a-zA-Z0-9.\-]*[a-zA-Z0-9])\s*(.*)" %
+                #     ipv4_pattern, h
+                # )
+                _res = h.strip().split()
+                if _res and len(_res) > 1:
+                    hs[_res[0]] = [_res[1], " ".join(_res)]
+        return hs, os.path.getmtime("/etc/hosts")
+    return hs, 0
+
+
+def get_host_ip(hostname, hosts):
+    host_ip = ""
+    for _ip, hs in hosts.items():
+        if hs[0] == hostname:
+            host_ip = _ip
+    return host_ip
+
+
 def get_local_interfaces():
     interfaces = []
     for _if in netifaces.interfaces():
@@ -631,3 +665,18 @@ def scan_port(network_segment, netmask, port):
         if t:
             t.join()
     return ips
+
+
+def sql_execute(user, password, port, sql):
+    db = MySQLdb.connect(
+        host="localhost", user=user, passwd=password, port=port
+    )
+    cursor = db.cursor()
+    try:
+        cursor.execute(sql)
+        return list(cursor)
+    # except MySQLdb.ProgrammingError as e:
+    #     msg = common_text(e.__str__())
+    #     return None, msg
+    finally:
+        db.close()
