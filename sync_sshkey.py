@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 # Author      : ShiFan
 # Created Date: 2021/7/14 15:26
-import json
 import signal
 from logging import getLogger
-from pwd import getpwnam
 
 import stat
 import time
@@ -14,6 +12,7 @@ import re
 
 from public_def import (
     chmod, chown, common_text, get_host_ip, ipv4_pattern, read_hosts, local_cmd,
+    RemoteError
 )
 from srkv.api import API
 
@@ -219,7 +218,7 @@ def proc():
             logger.debug("get ssh_keys from srkv")
             ssh_keys = sr.get_kv("ssh_keys")
             logger.info("ssh_keys: %s" % ssh_keys)
-        except Exception as e:
+        except RemoteError as e:
             logger.warning(common_text(e))
             ssh_keys = dict()
             logger.info("save ssh_keys: %s" % ssh_keys)
@@ -228,7 +227,7 @@ def proc():
             logger.debug("get known_hosts from srkv")
             known_hosts = sr.get_kv("known_hosts")
             logger.info("known_hosts: %s" % known_hosts)
-        except Exception as e:
+        except RemoteError as e:
             logger.warning(common_text(e))
             known_hosts = dict()
             logger.info("save known_hosts: %s" % known_hosts)

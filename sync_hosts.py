@@ -9,7 +9,7 @@ import time
 
 import os
 
-from public_def import common_text, get_host_ip, read_hosts
+from public_def import common_text, get_host_ip, read_hosts, RemoteError
 from srkv.api import API
 
 
@@ -54,7 +54,7 @@ def proc():
             logger.debug("get nodes from srkv")
             nodes = sr.get_kv("nodes")
             logger.info("nodes: %s" % nodes)
-        except Exception as e:
+        except RemoteError as e:
             logger.warning(common_text(e))
             nodes = {host_ip: hosts[host_ip]}
             logger.info("save nodes: %s" % nodes)
