@@ -30,7 +30,9 @@ from invoke import Responder, UnexpectedExit, run
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from zerorpc import Client
+from zerorpc import Client, RemoteError
+
+import MySQLdb
 
 
 RedHat = ["centos", "redhat"]
@@ -82,6 +84,7 @@ ipv4_pattern = (r"("
 
 ENV = os.environ
 manager = Manager()
+configuration_path = os.path.join(root_path, 'keeper.yaml')
 CONF = manager.dict()
 ENV.update(ETCDCTL_API="3")
 
@@ -213,7 +216,7 @@ def load_conf():
     global CONF
     try:
         message = ""
-        with open(os.path.join(root_path, 'keeper.yaml'), 'r') as f:
+        with open(configuration_path, 'r') as f:
             conf = yaml.safe_load(f)
         default = conf.get("keeper", dict())
         alter_key = default.get('alter_key', None)
@@ -249,12 +252,16 @@ def load_conf():
             log["level"] = "WARN"
         log["level"] = log["level"].upper()
         default["logging"] = log
+
+        for proc in default.get("procs", list()):
+            if not isinstance(proc, dict) or not set(
+                    proc.keys()) <= {"name", "reload_max", "requires"}:
+                RuntimeError("supervisory.procs configuration error")
+
         CONF["keeper"] = default
         return message
     except IOError:
-        raise RuntimeError(
-            'not found config: %s' % os.path.join(root_path, 'keeper.yaml')
-        )
+        raise RuntimeError('not found config: %s' % configuration_path)
     except yaml.YAMLError as e:
         raise RuntimeError("yaml syntax error: " + e.__str__())
 
@@ -371,7 +378,7 @@ if __load_message:
 def flush_conf():
     global CONF
     try:
-        with open(os.path.join(root_path, 'keeper.yaml'), 'w') as f:
+        with open(configuration_path, 'w') as f:
             CONF["keeper"]['alter_key'] = None
             _d = deepcopy(CONF)
             yaml.safe_dump(_d, f, default_flow_style=False)
@@ -454,8 +461,9 @@ def decrypt_text(text):
 
 
 def common_text(msg):
-    if isinstance(msg, unicode):
-        msg = msg.encode('utf-8')
+    if PYV == 2:
+        if isinstance(msg, unicode):
+            msg = msg.encode('utf-8')
     return msg
 
 
@@ -637,7 +645,10 @@ def scan_port(network_segment, netmask, port):
     #         for e in range(256):
     #             pl.append("%s.%s" % (p, e))
     #     _ips = pl
-    logger.debug((network_segment, netmask, port))
+    logger.debug(
+        "network segment: %s, netmask: %s, port: %s" %
+        (network_segment, netmask, port)
+    )
     ips = []
     lock = Lock()
 
@@ -658,6 +669,7 @@ def scan_port(network_segment, netmask, port):
     ).hosts():
         if i == 65535:
             i = 1
+        logger.debug("try connect %s" % _ip)
         t = Thread(target=connect, args=(str(_ip),))
         t.start()
         i += 1
