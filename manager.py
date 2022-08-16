@@ -7,6 +7,7 @@ from collections import OrderedDict
 from functools import wraps
 from importlib import import_module
 from multiprocessing import Process
+from traceback import format_exception
 
 import os
 import time
@@ -19,10 +20,10 @@ def run_module(func):
     def wrapped():
         try:
             return func()
-        except Exception as e:
+        except Exception:
+            traceback_exc = "".join(format_exception(*sys.exc_info()))
             logger.error(
-                "%s exception:\n%s\n%s" %
-                (func.__module__, e.__repr__(), e.__str__())
+                "%s exception:\n%s" % (func.__module__, traceback_exc)
             )
     return wrapped
 
