@@ -9,7 +9,7 @@ import time
 
 import os
 
-from public_def import common_text, get_host_ip, read_hosts, RemoteError
+from public_def import get_host_ip, read_hosts, RemoteError
 from srkv.api import API
 
 
@@ -40,12 +40,12 @@ def proc():
     signal.signal(signal.SIGINT, exit_proc)
 
     hosts, hosts_mtime = read_hosts()
-    logger.info(hosts)
+    logger.info("hosts: %s" % hosts)
     hostname = os.uname()[1]
     host_ip = get_host_ip(hostname, hosts)
     if not host_ip:
         logger.error("not found host ip from hosts.")
-    logger.info(host_ip)
+    logger.info("%s of ip: %s" % (hostname, host_ip))
     while 1:
         if os.uname()[1] != hostname:
             hosts, hosts_mtime = read_hosts()
@@ -55,7 +55,7 @@ def proc():
             nodes = sr.get_kv("nodes")
             logger.info("nodes: %s" % nodes)
         except RemoteError as e:
-            logger.warning(common_text(e))
+            logger.warning(e)
             nodes = {host_ip: hosts[host_ip]}
             logger.info("save nodes: %s" % nodes)
             sr.create_kv("nodes", nodes)

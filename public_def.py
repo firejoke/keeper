@@ -104,6 +104,10 @@ fernet = Fernet(
     )
 )
 
+__sr_default_port = 9050
+__sr_default_heartbeat = 150 * (10 ** -3)
+__sr_base_timeout = 1
+
 db_url = "sqlite:///%s" % os.path.join(root_path, ".keeper.db")
 db_engine = create_engine(db_url)
 ModelBase = declarative_base()
@@ -219,6 +223,7 @@ def load_conf():
         with open(configuration_path, 'r') as f:
             conf = yaml.safe_load(f)
         default = conf.get("keeper", dict())
+        srkv = conf.get("srkv", dict())
         alter_key = default.get('alter_key', None)
         if alter_key:
             try:
@@ -244,6 +249,8 @@ def load_conf():
 
         if not os.path.exists(log["dir"]):
             os.mkdir(log["dir"])
+        if not os.path.exists(os.path.join(log["dir"], "procs")):
+            os.mkdir(os.path.join(log["dir"], "procs"))
         if log["level"] and log["level"].lower() not in (
                 "info", "warn", "debug", "error"):
             message = 'LOG_Level value is invalid, will be set "WARN"'
@@ -254,21 +261,52 @@ def load_conf():
         default["logging"] = log
 
         for proc in default.get("procs", list()):
-            if not isinstance(proc, dict) or not set(
-                    proc.keys()) <= {"name", "reload_max", "requires"}:
-                RuntimeError("supervisory.procs configuration error")
-
+            if not isinstance(proc, dict) or \
+                    not set(proc.keys()) <= {"name", "reload_max", "requires"}:
+                raise RuntimeError("supervisory.procs configuration error")
         CONF["keeper"] = default
+        # srkv config
+        if not set(srkv.keys()) <= {"heartbeat", "port", "timeout", "scan",
+                                    "remote_nodes"}:
+            raise RuntimeError("srkv configuration error")
+        if "port" not in srkv:
+            srkv["port"] = __sr_default_port
+        elif not isinstance(srkv["port"], int):
+            raise TypeError("srkv.port must be an integer")
+        if "heartbeat" not in srkv:
+            srkv["heartbeat"] = __sr_default_heartbeat
+        elif not isinstance(srkv["heartbeat"], float):
+            raise TypeError("srkv.heartbeat must be a float")
+        if "timeout" not in srkv:
+            srkv["timeout"] = __sr_base_timeout
+        elif not isinstance(srkv["timeout"], (int, float)):
+            raise TypeError("srkv.timeout must be a number")
+        if "scan" not in srkv:
+            srkv["scan"] = True
+        elif not isinstance(srkv["scan"], bool):
+            raise TypeError("srkv.scan must be an boolean type")
+        if "remote_nodes" not in srkv:
+            srkv["remote_nodes"] = []
+        elif not isinstance(srkv["remote_nodes"], list):
+            raise TypeError("srkv.remote_nodes must be a list.")
+        for rn in srkv["remote_nodes"]:
+            if not ip_check(rn):
+                raise TypeError(
+                    "srkv.remote_nodes must be a valid ipaddress list"
+                )
+        CONF["srkv"] = srkv
+
         return message
     except IOError:
-        raise RuntimeError('not found config: %s' % configuration_path)
+        raise IOError('not found config: %s' % configuration_path)
     except yaml.YAMLError as e:
-        raise RuntimeError("yaml syntax error: " + e.__str__())
+        raise SyntaxError("yaml syntax error: " + e.__str__())
 
 
 __load_message = load_conf()
 __log_level = CONF["keeper"]["logging"]["level"]
 __log_dir = CONF["keeper"]["logging"]["dir"]
+__procs_log_dir = os.path.join(__log_dir, "procs")
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -342,7 +380,7 @@ LOGGING = {
 for proc in CONF["supervisory"].get("procs"):
     LOGGING["handlers"][proc["name"]] = {
         "level": __log_level,
-        "filename": os.path.join(__log_dir, "%s.log" % proc["name"])
+        "filename": os.path.join(__procs_log_dir, "%s.log" % proc["name"])
     }
     LOGGING["loggers"][proc["name"]] = {
         "handlers": [proc["name"]],
@@ -461,9 +499,8 @@ def decrypt_text(text):
 
 
 def common_text(msg):
-    if PYV == 2:
-        if isinstance(msg, unicode):
-            msg = msg.encode('utf-8')
+    if isinstance(msg, unicode):
+        msg = msg.encode('utf-8')
     return msg
 
 

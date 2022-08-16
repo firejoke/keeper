@@ -219,7 +219,7 @@ def proc():
             ssh_keys = sr.get_kv("ssh_keys")
             logger.info("ssh_keys: %s" % ssh_keys)
         except RemoteError as e:
-            logger.warning(common_text(e))
+            logger.warning(e)
             ssh_keys = dict()
             logger.info("save ssh_keys: %s" % ssh_keys)
             sr.create_kv("ssh_keys", ssh_keys)
@@ -228,7 +228,7 @@ def proc():
             known_hosts = sr.get_kv("known_hosts")
             logger.info("known_hosts: %s" % known_hosts)
         except RemoteError as e:
-            logger.warning(common_text(e))
+            logger.warning(e)
             known_hosts = dict()
             logger.info("save known_hosts: %s" % known_hosts)
             sr.create_kv("known_hosts", known_hosts)

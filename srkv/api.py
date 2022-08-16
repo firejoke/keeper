@@ -7,9 +7,10 @@ from public_def import CONF, RpcClient, SRkvLocalSock
 class API(object):
     def __init__(self):
         conf = CONF.get(__package__)
-        heartbeat = conf.get("heartbeat", 150 * (10 ** -3))
-        timeout = conf.get("timeout", 1)
-        self.rpc_client = RpcClient(heartbeat=heartbeat, timeout=timeout)
+        self.rpc_client = RpcClient(
+            heartbeat=conf.get("heartbeat"),
+            timeout=conf.get("timeout")
+        )
         self.rpc_client.connect("ipc://%s" % SRkvLocalSock)
 
     def info(self):

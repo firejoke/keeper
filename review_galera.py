@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 # Author      : ShiFan
 # Created Date: 2021/7/5 17:22
-import json
 import signal
 import sys
 from logging import getLogger
@@ -11,7 +10,7 @@ import re
 import time
 
 from public_def import (
-    CONF, Config, OS_SERIES, check_port, common_text, sql_execute,
+    CONF, Config, OS_SERIES, check_port, sql_execute,
     NoOptionError, NoSectionError, RemoteError
 )
 from srkv.api import API
@@ -29,7 +28,7 @@ def get_data_dir_stat(datadir):
                 _f = os.path.join(_p, _f)
                 _mtime = os.path.getmtime(_f)
                 if _mtime > mtime:
-                    logger.debug(_f, _mtime)
+                    logger.debug("%s: %s" % (_f, _mtime))
                     mtime = _mtime
     return mtime
 
@@ -61,10 +60,11 @@ def check_mysql_proc(port):
 def get_wsrep_status(user, password, port):
     try:
         status = sql_execute(user, password, port, 'show status like "wsrep%"')
-        status = {var[0]: var[1] for var in status[0]}
+        logger.debug("get wsrep status: %s" % status)
+        status = {var[0]: var[1] for var in status}
         return status
     except Exception as e:
-        logger.error(common_text(e))
+        logger.error(e)
         return None
 
 
@@ -73,10 +73,11 @@ def get_wsrep_variables(user, password, port):
         variables = sql_execute(
             user, password, port, 'show global variables like "wsrep%"'
         )
-        variables = {var[0]: var[1] for var in variables[0]}
+        logger.debug("get wsrep variables: %s" % variables)
+        variables = {var[0]: var[1] for var in variables}
         return variables
     except Exception as e:
-        logger.error(common_text(e))
+        logger.error(e)
         return None
 
 
@@ -135,7 +136,9 @@ def proc():
         m_password = mariadb_conf.get("pd")
         m_port = mariadb_conf.get("port")
         wsrep_status = get_wsrep_status(m_user, m_password, m_port)
+        logger.debug("wsrep_status: %s" % wsrep_status)
         wsrep_variables = get_wsrep_variables(m_user, m_password, m_port)
+        logger.debug("wsrep_variables: %s" % wsrep_variables)
         if wsrep_status:
             wsrep_ready = wsrep_status.get("wsrep_ready")
         else:
@@ -164,13 +167,14 @@ def proc():
             if not old_stat:
                 sr.create_kv(
                     key="galera_%s" % node_name,
-                    value="'%s'" % json.dumps(new_stat)
+                    value=new_stat
                 )
             else:
-                logger.info("old stat: %s" % old_stat)
+                logger.info("will update, old stat: %s" % old_stat)
                 sr.update_kv(
                     key="galera_%s" % node_name,
-                    value="'%s'" % json.dumps(new_stat)
+                    value=new_stat
                 )
-        logger.info("new stat: %s" % new_stat)
-        # time.sleep(1)
+            logger.info("new stat: %s" % new_stat)
+
+        time.sleep(1)
