@@ -11,8 +11,8 @@ import os
 import re
 
 from public_def import (
-    chmod, chown, common_text, get_host_ip, ipv4_pattern, read_hosts, local_cmd,
-    RemoteError
+    CONF, chmod, chown, get_host_ip, ipv4_pattern, read_hosts, local_cmd,
+    RemoteError,
 )
 from srkv.api import API
 
@@ -205,6 +205,7 @@ def proc():
     logger.info(
         "r know hosts: %s, r known mtime: %s." % (r_known_hosts, r_known_mtime)
     )
+    CONF["_%s_ready" % __name__] = True
     while 1:
         if os.uname()[1] != hostname:
             hosts, hosts_mtime = read_hosts()

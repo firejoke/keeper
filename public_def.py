@@ -222,6 +222,8 @@ def load_conf():
         message = ""
         with open(configuration_path, 'r') as f:
             conf = yaml.safe_load(f)
+        if not conf:
+            conf = dict()
         default = conf.get("keeper", dict())
         srkv = conf.get("srkv", dict())
         alter_key = default.get('alter_key', None)
@@ -341,8 +343,12 @@ LOGGING = {
             "filename": os.path.join(__log_dir, "sql.log"),
         },
         "zerorpc": {
+            "mixin": False,
             "level": __log_level,
             "filename": os.path.join(__log_dir, "zerorpc.log"),
+            "class": "logging.handlers.RotatingFileHandler",
+            "maxBytes": 100 * 1024 * 1024,
+            "formatter": "debug",
         },
         "srkv": {
             "level": __log_level,
@@ -386,24 +392,17 @@ for proc in CONF["supervisory"].get("procs"):
         "handlers": [proc["name"]],
         "level": __log_level
     }
-__debug_file_handler_mixin = {
-            "class": "logging.handlers.RotatingFileHandler",
-            "maxBytes": 100 * 1024 * 1024,
-            "backupCount": 6,
-            "formatter": "debug",
-        }
 __file_handler_mixin = {
             "class": "logging.handlers.TimedRotatingFileHandler",
-            "when": "W0",
-            "backupCount": 6,
+            "when": CONF["keeper"]["logging"]["when"],
+            "backupCount": CONF["keeper"]["logging"]["backupCount"],
             "formatter": "verbose",
         }
 for name, handler in LOGGING["handlers"].items():
     if "filename" in handler:
-        if __log_level == "DEBUG":
-            handler.update(__debug_file_handler_mixin)
-        else:
+        if handler.get("mixin", True):
             handler.update(__file_handler_mixin)
+        handler.pop("mixin", None)
 
 dictConfig(LOGGING)
 
@@ -415,14 +414,16 @@ if __load_message:
 
 def flush_conf():
     global CONF
-    try:
-        with open(configuration_path, 'w') as f:
-            CONF["keeper"]['alter_key'] = None
-            _d = deepcopy(CONF)
-            yaml.safe_dump(_d, f, default_flow_style=False)
-            return
-    except (IOError, yaml.YAMLError) as e:
-        return common_text(e)
+    _d = deepcopy(CONF)
+    _d["keeper"]['alter_key'] = None
+    for k in _d.keys():
+        if k.startswith("_") and k.endswith("ready"):
+            logger.debug("conf pop %s" % k)
+            _d.pop(k)
+    with open(configuration_path, 'w') as f:
+        _conf = yaml.safe_dump(_d, default_flow_style=False)
+        logger.info("flush configuration:\n%s" % _conf)
+        f.write(_conf)
 
 
 if PYV == 3:

@@ -5,16 +5,24 @@ keeper:
   dir: /var/log/keeper/
   when: W0
   backupCount: 6
- procs: []
+ procs:
+  - name: protect_document
+    reload_max: 10
+  - name: sync_hosts
+    reload_max: 10
+  - name: sync_sshkey
+    reload_max: 10
+  - name: review_galera
+    reload_max: 10
 #  - name: module name
 #    reload_max: 10
 #    requires:
 #     - require module name
 
 srkv:
- heartbeat: 0.15
+ heartbeat: 1.5
  port: 5656
- timeout: 1
+ timeout: 3
  scan: true
  remote_nodes: []
 
@@ -22,7 +30,7 @@ protect_document:
  documents: []
 #   - /etc/libvirt/qemu/xxxx.xml
 
-watcher_galera:
+review_galera:
  mariadb:
   host: 127.0.0.1
   user: root

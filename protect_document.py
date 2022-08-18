@@ -17,6 +17,7 @@ logger = getLogger(__name__)
 
 
 def proc():
+    CONF["_%s_ready" % __name__] = True
     while 1:
         backups_dir = CONF.get("conf_dirs", "./document_backups")
         if not os.path.exists(backups_dir):

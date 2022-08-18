@@ -124,6 +124,7 @@ def proc():
         logger.error("not found configure for galera")
         sys.exit(signal.SIGINT)
 
+    CONF["_%s_ready" % __name__] = True
     while 1:
         try:
             old_stat = sr.get_kv("galera_%s" % node_name)

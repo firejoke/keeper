@@ -3,13 +3,14 @@
 # Created Date: 2021/11/3 17:57
 import json
 import signal
+import sys
 from logging import getLogger
 
 import time
 
 import os
 
-from public_def import get_host_ip, read_hosts, RemoteError
+from public_def import CONF, get_host_ip, read_hosts, RemoteError
 from srkv.api import API
 
 
@@ -45,7 +46,9 @@ def proc():
     host_ip = get_host_ip(hostname, hosts)
     if not host_ip:
         logger.error("not found host ip from hosts.")
+        sys.exit(signal.SIGINT)
     logger.info("%s of ip: %s" % (hostname, host_ip))
+    CONF["_%s_ready" % __name__] = True
     while 1:
         if os.uname()[1] != hostname:
             hosts, hosts_mtime = read_hosts()

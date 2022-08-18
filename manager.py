@@ -38,8 +38,6 @@ if __name__ == '__main__':
         logger.error('not found config: %s' % configuration_path)
         sys.exit(1)
     sub_processes = OrderedDict()
-    # TODO: 一个依赖程序准备好了的标志
-    interval = 20
     default = CONF["keeper"]
     default["procs"].insert(
         0,
@@ -51,6 +49,9 @@ if __name__ == '__main__':
     )
 
     for p in default["procs"]:
+        if p["name"].startswith("_"):
+            logger.error("The process name cannot begin with a _")
+            continue
         logger.info("import package: %s" % p)
         try:
             package = import_module(p["name"])
@@ -64,18 +65,23 @@ if __name__ == '__main__':
                 p["requires"] = list()
             if p["name"] != "srkv.server":
                 p["requires"].insert(0, "srkv.server")
-            _proc = getattr(package, "proc")
+            _proc = run_module(getattr(package, "proc"))
             sub_processes[p["name"]] = dict(
+                module=package,
                 active=True,
-                target=run_module(_proc),
-                process=Process(target=run_module(_proc)),
+                target=_proc,
+                process=Process(target=_proc),
                 requires=p["requires"],
                 reload_max=p["reload_max"],
                 last_reload=time.time(),
                 reload_number=0
             )
+            CONF["_%s_ready" % p["name"]] = False
         except ImportError as e:
             logger.error(e)
+        except AttributeError as e:
+            logger.error(e)
+
 
     def exit_procs(signum=None, frame=None):
         if os.getpid() == main_pid:
@@ -98,7 +104,12 @@ if __name__ == '__main__':
                 if proc["process"] and proc["process"].is_alive():
                     logger.info("%s will terminate" % name)
                     os.kill(proc["process"].pid, signal.SIGINT)
-            flush_conf()
+                CONF["_%s_ready" % name] = False
+            try:
+                flush_conf()
+            except Exception:
+                traceback_exc = "".join(format_exception(*sys.exc_info()))
+                logger.error(traceback_exc)
             sys.exit(0)
         return
 
@@ -118,10 +129,18 @@ if __name__ == '__main__':
         for k, v in sub_processes.items():
             for _m in v["requires"]:
                 if not sub_processes.get(_m):
-                    logger.error("%s not load, %s will not load" % (_m, k))
+                    logger.error("%s not import, %s will be remove" % (_m, k))
+                    sub_processes.pop(k)
                     break
                 if not sub_processes[_m]["process"].is_alive():
-                    logger.error("%s is not alive, %s will not load" % (_m, k))
+                    logger.warning(
+                        "%s is not alive, %s will not load" % (_m, k)
+                    )
+                    break
+                if not CONF["_%s_ready" % _m]:
+                    logger.warning(
+                        "%s is not ready, %s will not load." % (_m, k)
+                    )
                     break
             else:
                 if not v["active"]:
@@ -132,6 +151,8 @@ if __name__ == '__main__':
                         logger.error("\"%s\" exit" % k)
                         v["process"].terminate()
                         logger.warning('"%s" terminate.' % k)
+                        reload(v["module"])
+                        v["target"] = run_module(getattr(v["module"], "proc"))
                         v["process"] = Process(target=v["target"])
                         logger.warning('"%s" will restart.' % k)
                 else:
@@ -145,9 +166,6 @@ if __name__ == '__main__':
                             v["process"].start()
                             v["reload_number"] += 1
                             logger.info("%s pid: %s" % (k, v["process"].pid))
-                            if k == "srkv.server":
-                                logger.info("Intermittent %s seconds" % interval)
-                                time.sleep(interval)
                         except Exception as e:
                             logger.error(e)
                     else:
