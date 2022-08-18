@@ -98,7 +98,8 @@ class Node(Server):
         self.term_counter = 0
         self.have_voted = False
         self.heartbeat = kwargs.get("heartbeat")
-        self.timeout = kwargs.get("timeout") + self.heartbeat + uniform(0.5, 2.5)
+        self.base_timeout = kwargs.get("timeout")
+        self.timeout = self.base_timeout + self.heartbeat + uniform(0.5, 2.5)
         self.rpc_port = kwargs["port"]
         self.scan_remote = kwargs.get("scan", False)
         self.votes = dict()
@@ -132,23 +133,21 @@ class Node(Server):
 
     def _check_transaction_ready(self):
         now = time()
-        while time() - now <= self.timeout:
-            if self._repository_transaction_ready:
-                break
+        while not self._repository_transaction_ready:
+            if time() - now <= self.base_timeout:
+                sleep(max(1, self.heartbeat / 2.0))
             else:
-                sleep(self.heartbeat)
+                raise RuntimeError("transaction is not ready.")
         else:
-            raise RuntimeError("transaction is not ready.")
+            return True
 
     def _check_repository_ready(self):
         now = time()
-        while time() - now <= self.timeout:
-            if self._repository_ready:
-                break
+        while not self._repository_ready:
+            if time() - now <= self.base_timeout:
+                sleep(max(1, self.heartbeat / 2.0))
             else:
-                sleep(self.heartbeat)
-        else:
-            raise RuntimeError("repository is not ready.")
+                raise RuntimeError("repository is not ready.")
 
     @check_params
     @encrypt_result
@@ -311,6 +310,7 @@ class Node(Server):
                 self._leader = self
                 self._repository_ready = True
                 self._repository_transaction_ready = True
+                CONF["_%s_ready" % __name__] = True
             else:
                 self.role = 2
                 self._leader = self.remote_nodes[self.leader_uid]
@@ -360,7 +360,7 @@ class Node(Server):
                     self._db_session.rollback()
 
     def _connect_node(self, ipaddresses):
-        c = RpcClient(heartbeat=self.heartbeat, timeout=self.timeout)
+        c = RpcClient(heartbeat=self.heartbeat)
         for ip in ipaddresses:
             _url = "tcp://%s:%s" % (ip, self.rpc_port)
             try:
@@ -449,6 +449,7 @@ class Node(Server):
     @encrypt_result
     def create_kv(self, key, value):
         self._check_repository_ready()
+        self._check_transaction_ready()
         if self.role == 1:
             RuntimeError("Node not ready.")
         elif self.role == 2:
@@ -479,6 +480,7 @@ class Node(Server):
     @encrypt_result
     def update_kv(self, key, value):
         self._check_repository_ready()
+        self._check_transaction_ready()
         if self.role == 1:
             RuntimeError("Node not ready.")
         elif self.role == 2:
@@ -509,6 +511,7 @@ class Node(Server):
     @encrypt_result
     def delete_kv(self, key):
         self._check_repository_ready()
+        self._check_transaction_ready()
         if self.role == 1:
             RuntimeError("Node not ready.")
         elif self.role == 2:
@@ -543,6 +546,7 @@ class Node(Server):
     @encrypt_result
     def get_kv(self, key, prefix=False):
         self._check_repository_ready()
+        self._check_transaction_ready()
         if self.role == 1:
             RuntimeError("Node is not ready")
         elif self.role == 2:
@@ -561,13 +565,19 @@ class Node(Server):
     def append_repository_transaction(self, **transaction):
         self._check_transaction_ready()
         logger.debug(transaction)
-        if self.repository_transaction_id > transaction["id"]:
-            return False
-        else:
+        if self.repository_transaction_id < transaction["id"]:
             self._save_transaction(**transaction)
             self.repository_transaction[transaction["id"]] = transaction
             self._repository_transaction_event.set()
             return True
+        elif self.repository_transaction_id == transaction["id"]:
+            self._repository_transaction_ready = False
+            CONF["_%s_ready"] = False
+            self._leader = None
+            self.role = 1
+            self.have_voted = False
+        else:
+            return False
 
     def _save_transaction(self, **kwargs):
         logger.debug("save transaction:\n%s" % kwargs)
@@ -587,13 +597,13 @@ class Node(Server):
         return self._update_transaction(**transaction)
 
     def _update_transaction(self, **transaction):
+        logger.debug("new:\n%s" % transaction)
         try:
             ac = self._db_session.query(Transaction).get(transaction["id"])
             logger.debug("update transaction, old:\n%s" % ac.__dict__)
             for key, value in transaction.items():
                 if getattr(ac, key) != value:
                     setattr(ac, key, value)
-            logger.debug("new:\n%s" % ac.__dict__)
             self._db_session.commit()
             self.repository_transaction[transaction["id"]] = transaction
             self._repository_transaction_event.set()
@@ -617,7 +627,7 @@ class Node(Server):
         getattr(self, transaction["roll_action"])(*args)
 
     def _sync_transaction(self):
-        logger.info("start sync transaction from leader.")
+        logger.info("Starts synchronizing transactions from leader.")
         self._repository_transaction_event.clear()
         leader_info = self._leader.info()
         for tid in xrange(0, leader_info["transaction_id"]):
@@ -661,6 +671,9 @@ class Node(Server):
         logger.info("watch kv")
         sync_votes = (len(self.remote_nodes.keys()) + 1) / 2.0
         while 1:
+            if not self._repository_transaction_ready:
+                sleep(self.timeout)
+                continue
             if self._repository_transaction_daemon_exit:
                 logger.warning("repository transaction daemon exit.")
                 return
@@ -697,6 +710,17 @@ class Node(Server):
                             )
                             if rpc.append_repository_transaction(**ac):
                                 success += 1
+                            else:
+                                logger.error(
+                                    "The transaction on node(%s) "
+                                    "is relatively new" % uid
+                                )
+                                self._repository_transaction_ready = False
+                                CONF["_%s_ready"] = False
+                                self._leader = None
+                                self.role = 1
+                                self.have_voted = False
+                                break
                         except Exception as e:
                             logger.error(
                                 "node(%s) failed to add a transaction: \n%s" %
@@ -746,7 +770,7 @@ class Node(Server):
                             continue
                         try:
                             logger.info(
-                                "node(%s) will sync the transactions: \n%s"
+                                "node(%s) synchronizes transactions: \n%s"
                                 % (uid, ac)
                             )
                             if ac["state"] == "committed":
@@ -755,8 +779,8 @@ class Node(Server):
                             logger.info("Transaction synchronization success.")
                         except Exception as e:
                             logger.error(
-                                "node(%s) failed to sync a transaction: "
-                                "\n%s" % (uid, e)
+                                "node(%s) failed to synchronizes "
+                                "the transaction: \n%s" % (uid, e)
                             )
 
                 self._repository_ready = True
@@ -769,7 +793,7 @@ class Node(Server):
     def _watch_cluster(self, ):
         logger.info("connect remote nodes.")
         if self.scan_remote:
-            conf = CONF.get(__package__, dict())
+            conf = CONF.get(__package__)
             conf["scan"] = False
             CONF[__package__] = conf
             logger.info("scan network segment")
@@ -799,23 +823,27 @@ class Node(Server):
                 else:
                     logger.info("my role: %s" % SRkvNodeRole[self.role])
 
-            # 确定leader节点存活状态。如果反过来由leader节点通知其他节点，
-            # 会占用自身线程等待时间和最后请求节点的超时时间
             elif self.role == 2:
                 if not self._repository_transaction_ready:
                     try:
                         _g = self._task_pool.spawn(self._sync_transaction)
                         _g.join()
-                        logger.info("sync transaction success!")
+                        logger.info("Transaction synchronization success!")
+                        CONF["_%s_ready" % __name__] = True
                         self._repository_transaction_ready = True
                         self._repository_ready = True
                     except RemoteError as e:
-                        logger.error("sync transaction failed: \n%s" % e)
+                        logger.error(
+                            "Transaction synchronization failed: \n%s" % e
+                        )
                 if not self.leader_keepalive:
                     logger.error("leader(%s) is offline!" % self.leader_uid)
+                    CONF["_%s_ready" % __name__] = False
                     self._leader = None
                     self.role = 1
                     self.have_voted = False
+                    self._repository_transaction_ready = False
+                    self._repository_ready = False
                 else:
                     self.leader_keepalive = False
                     sleep(self.timeout)
@@ -850,7 +878,7 @@ class Node(Server):
                     args = (ac.key,)
                 getattr(self, ac.action)(*args)
             self.repository_transaction_id = ac.id + 1
-            self._repository_transaction_ready = True
+        self._repository_transaction_ready = True
 
         try:
             self._cluster_daemon_exit = 0
