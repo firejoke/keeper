@@ -21,10 +21,11 @@ keeper:
 
 srkv:
  heartbeat: 1.5
- port: 5656
+ port: 666
  timeout: 3
  scan: true
- remote_nodes: []
+ nodes: []
+ exclude_ipaddress: []
 
 protect_document:
  documents: []
