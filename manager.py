@@ -100,11 +100,15 @@ if __name__ == '__main__':
                 )
             )
             for name, proc in sub_processes.items():
-                sub_processes[name]["active"] = False
+                if name == "srkv.server":
+                    continue
+                proc["active"] = False
                 if proc["process"] and proc["process"].is_alive():
                     logger.info("%s will terminate" % name)
                     os.kill(proc["process"].pid, signal.SIGINT)
                 CONF["_%s_ready" % name] = False
+            os.kill(sub_processes["srkv.server"]["process"], signal.SIGINT)
+            CONF["_srkv.server_ready"] = False
             try:
                 flush_conf()
             except Exception:

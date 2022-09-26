@@ -104,7 +104,7 @@ fernet = Fernet(
     )
 )
 
-__sr_default_port = 9050
+__sr_default_port = 666
 __sr_default_heartbeat = 150 * (10 ** -3)
 __sr_base_timeout = 1
 
@@ -118,6 +118,58 @@ SRkvNodeRole = {
     1: "Candidate",
     2: "Follower",
 }
+
+
+if PYV == 3:
+    from configparser import ConfigParser, NoOptionError, NoSectionError
+
+    class Config(ConfigParser):
+
+        def optionxform(self, optionstr):
+            return optionstr
+
+        def set(self, section, option, value=None):
+            logger.info("set %s=%s for %s" % (option, value, section))
+            super(Config, self).set(section, option, value)
+
+        def remove_option(self, section, option):
+            logger.warning("remove %s for %s" % (option, section))
+            super(Config, self).remove_option(section, option)
+
+        def remove_section(self, section):
+            logger.warning("remove section: %s" % section)
+            super(Config, self).remove_section(section)
+
+        def add_section(self, section):
+            logger.info('add section: %s' % section)
+            super(Config, self).add_section(section)
+
+    encoding_type = str
+elif PYV == 2:
+    from ConfigParser import ConfigParser, NoOptionError, NoSectionError
+
+    class Config(ConfigParser):
+
+        def optionxform(self, optionstr):
+            return optionstr
+
+        def set(self, section, option, value=None):
+            logger.info("set %s=%s for %s" % (option, value, section))
+            ConfigParser.ConfigParser.set(self, section, option, value)
+
+        def remove_option(self, section, option):
+            logger.warning("remove %s for %s" % (option, section))
+            ConfigParser.ConfigParser.remove_option(self, section, option)
+
+        def remove_section(self, section):
+            logger.warning("remove section: %s" % section)
+            ConfigParser.ConfigParser.remove_section(self, section)
+
+        def add_section(self, section):
+            logger.info('add section: %s' % section)
+            ConfigParser.ConfigParser.add_section(self, section)
+
+    encoding_type = unicode
 
 
 class RpcClient(Client):
@@ -216,6 +268,16 @@ class ColorFormatter(logging.Formatter):
         return self.colorize(msg, fg="red", opts=("bold", "reverse"))
 
 
+def ip_check(ip_address):
+    ip_address = encoding_type(ip_address)
+
+    try:
+        ipaddress.ip_address(ip_address)
+        return True
+    except (ValueError, ipaddress.AddressValueError):
+        return False
+
+
 def load_conf():
     global CONF
     try:
@@ -268,8 +330,9 @@ def load_conf():
                 raise RuntimeError("supervisory.procs configuration error")
         CONF["keeper"] = default
         # srkv config
-        if not set(srkv.keys()) <= {"heartbeat", "port", "timeout", "scan",
-                                    "remote_nodes"}:
+        if not set(srkv.keys()) <= {
+            "heartbeat", "port", "timeout", "scan", "nodes", "exclude_ipaddress"
+        }:
             raise RuntimeError("srkv configuration error")
         if "port" not in srkv:
             srkv["port"] = __sr_default_port
@@ -287,14 +350,14 @@ def load_conf():
             srkv["scan"] = True
         elif not isinstance(srkv["scan"], bool):
             raise TypeError("srkv.scan must be an boolean type")
-        if "remote_nodes" not in srkv:
-            srkv["remote_nodes"] = []
-        elif not isinstance(srkv["remote_nodes"], list):
-            raise TypeError("srkv.remote_nodes must be a list.")
-        for rn in srkv["remote_nodes"]:
-            if not ip_check(rn):
+        if "nodes" not in srkv:
+            srkv["nodes"] = []
+        elif not isinstance(srkv["nodes"], list):
+            raise TypeError("srkv.nodes must be a list.")
+        for n in srkv["nodes"]:
+            if not ip_check(n):
                 raise TypeError(
-                    "srkv.remote_nodes must be a valid ipaddress list"
+                    "srkv.nodes must be a valid ipaddress list"
                 )
         CONF["srkv"] = srkv
 
@@ -396,7 +459,7 @@ __file_handler_mixin = {
             "class": "logging.handlers.TimedRotatingFileHandler",
             "when": CONF["keeper"]["logging"]["when"],
             "backupCount": CONF["keeper"]["logging"]["backupCount"],
-            "formatter": "verbose",
+            "formatter": "debug" if __log_level == "DEBUG" else "verbose",
         }
 for name, handler in LOGGING["handlers"].items():
     if "filename" in handler:
@@ -424,58 +487,6 @@ def flush_conf():
         _conf = yaml.safe_dump(_d, default_flow_style=False)
         logger.info("flush configuration:\n%s" % _conf)
         f.write(_conf)
-
-
-if PYV == 3:
-    from configparser import ConfigParser, NoOptionError, NoSectionError
-
-    class Config(ConfigParser):
-
-        def optionxform(self, optionstr):
-            return optionstr
-
-        def set(self, section, option, value=None):
-            logger.info("set %s=%s for %s" % (option, value, section))
-            super(Config, self).set(section, option, value)
-
-        def remove_option(self, section, option):
-            logger.warning("remove %s for %s" % (option, section))
-            super(Config, self).remove_option(section, option)
-
-        def remove_section(self, section):
-            logger.warning("remove section: %s" % section)
-            super(Config, self).remove_section(section)
-
-        def add_section(self, section):
-            logger.info('add section: %s' % section)
-            super(Config, self).add_section(section)
-
-    code_type = str
-elif PYV == 2:
-    from ConfigParser import ConfigParser, NoOptionError, NoSectionError
-
-    class Config(ConfigParser):
-
-        def optionxform(self, optionstr):
-            return optionstr
-
-        def set(self, section, option, value=None):
-            logger.info("set %s=%s for %s" % (option, value, section))
-            ConfigParser.ConfigParser.set(self, section, option, value)
-
-        def remove_option(self, section, option):
-            logger.warning("remove %s for %s" % (option, section))
-            ConfigParser.ConfigParser.remove_option(self, section, option)
-
-        def remove_section(self, section):
-            logger.warning("remove section: %s" % section)
-            ConfigParser.ConfigParser.remove_section(self, section)
-
-        def add_section(self, section):
-            logger.info('add section: %s' % section)
-            ConfigParser.ConfigParser.add_section(self, section)
-
-    code_type = unicode
 
 
 def get_base_methods(cls, obj):
@@ -622,38 +633,6 @@ def get_local_interfaces():
                 if _ip.get("addr") not in (None, "127.0.0.1"):
                     interfaces.append(_ip)
     return interfaces
-
-
-def ip_check(ip_address):
-    ip_address = code_type(ip_address)
-    # try:
-    #     import ipaddress
-
-    try:
-        ipaddress.ip_address(ip_address)
-        return True
-    except (ValueError, ipaddress.AddressValueError):
-        return False
-    # except ImportError:
-    #     from socket import error
-    #
-    #     try:
-    #         from socket import inet_pton, AF_INET
-    #
-    #         inet_pton(AF_INET, ip_address)
-    #     except ImportError:
-    #         try:
-    #             from socket import inet_aton
-    #
-    #             inet_aton(ip_address)
-    #         except error:
-    #             return False
-    #         else:
-    #             return ip_address.count('.') == 3
-    #     except error:
-    #         return False
-    #     else:
-    #         return True
 
 
 def check_port(port, ipaddres="127.0.0.1", timeout=0.1):
