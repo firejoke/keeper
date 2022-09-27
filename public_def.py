@@ -328,6 +328,8 @@ def load_conf():
             if not isinstance(proc, dict) or \
                     not set(proc.keys()) <= {"name", "reload_max", "requires"}:
                 raise RuntimeError("supervisory.procs configuration error")
+            if not isinstance(proc["reload_max"], (int, float)):
+                raise RuntimeError("The value of reload_max has to be a number")
         CONF["keeper"] = default
         # srkv config
         if not set(srkv.keys()) <= {

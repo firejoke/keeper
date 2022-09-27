@@ -2,6 +2,8 @@
 # Author      : ShiFan
 # Created Date: 2022/5/19 17:23
 import json
+from traceback import format_exception
+
 import signal
 from collections import Iterator, Mapping, OrderedDict, Sequence, Set
 from functools import wraps
@@ -701,11 +703,13 @@ class Node(Server):
                 self._rollback_transaction(ta)
                 self._delete_transaction(ta)
             tid -= 1
+        logger.info("Transaction rollback completed.")
         for tid in xrange(roll_id, leader_info["transaction_id"]):
             ta = self._leader.get_repository_transaction(tid)
             if ta["state"] in ("committed", "failed"):
                 self._save_transaction(**ta)
                 self.repository_transaction[tid] = ta
+        logger.info("Transaction saved.")
         return True
 
     def _watch_kv(self, ):
@@ -953,20 +957,51 @@ class Node(Server):
             self.repository_transaction_id = ac.id + 1
         self._repository_transaction_ready = True
 
-        try:
-            self._cluster_daemon_exit = 0
-            self._cluster_daemon = spawn(self._watch_cluster)
-            self._repository_transaction_daemon = spawn(self._watch_kv)
-            self._repository_transaction_daemon_exit = 0
-            self._acceptor_task = spawn(self._acceptor)
-            self._acceptor_task.get()
-            self._cluster_daemon.get()
-            self._repository_transaction_daemon.get()
-        except Exception as e:
-            logger.error(e)
-        finally:
-            self.stop()
-            self._task_pool.join(raise_error=True)
+        self._cluster_daemon_exit = 0
+        self._cluster_daemon = spawn(self._watch_cluster)
+        self._repository_transaction_daemon = spawn(self._watch_kv)
+        self._repository_transaction_daemon_exit = 0
+        self._acceptor_task = spawn(self._acceptor)
+        while 1:
+            sleep(1)
+            if self._acceptor_task.ready():
+                _exc_info = "".join(
+                    format_exception(*self._acceptor_task.exc_info)
+                )
+                if _exc_info:
+                    logger.error(
+                        "acceptor task exits unexpectedly: %s" % _exc_info
+                    )
+                else:
+                    logger.info("acceptor task exit.")
+                break
+            if self._cluster_daemon.ready():
+                _exc_info = "".join(
+                    format_exception(*self._cluster_daemon.exc_info)
+                )
+                if _exc_info:
+                    logger.error(
+                        "cluster_daemon task exits unexpectedly: %s" % _exc_info
+                    )
+                else:
+                    logger.info("cluster_daemon exit.")
+                break
+            if self._repository_transaction_daemon.ready():
+                _exc_info = "".join(
+                    format_exception(
+                        *self._repository_transaction_daemon.exc_info
+                    )
+                )
+                if _exc_info:
+                    logger.error(
+                        "repository_transaction_daemon exits unexpectedly: %s"
+                        % _exc_info
+                    )
+                else:
+                    logger.info("repository transaction daemon exit.")
+                break
+        self.stop()
+        self._task_pool.join(raise_error=True)
 
     def stop(self, ):
         logger.warning("node server stop.")
