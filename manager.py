@@ -77,10 +77,8 @@ if __name__ == '__main__':
                 reload_number=0
             )
             CONF["_%s_ready" % p["name"]] = False
-        except ImportError as e:
-            logger.error(e)
-        except AttributeError as e:
-            logger.error(e)
+        except Exception:
+            logger.error("\n%s" % "".join(format_exception(*sys.exc_info())))
 
 
     def exit_procs(signum=None, frame=None):
@@ -107,7 +105,7 @@ if __name__ == '__main__':
                     logger.info("%s will terminate" % name)
                     os.kill(proc["process"].pid, signal.SIGINT)
                 CONF["_%s_ready" % name] = False
-            os.kill(sub_processes["srkv.server"]["process"], signal.SIGINT)
+            os.kill(sub_processes["srkv.server"]["process"].pid, signal.SIGINT)
             CONF["_srkv.server_ready"] = False
             try:
                 flush_conf()

@@ -2,6 +2,7 @@
 # Author      : ShiFan
 # Created Date: 2022/5/19 17:23
 import json
+import sys
 from traceback import format_exception
 
 import signal
@@ -12,7 +13,7 @@ from logging import getLogger
 import os
 from copy import deepcopy, copy
 
-from gevent import sleep, spawn
+from gevent import sleep, spawn, Greenlet, wait
 from gevent.event import Event as gEvent
 from random import uniform
 
@@ -121,9 +122,7 @@ class Node(Server):
         self._repository_transaction_ready = False
         self._repository_transaction_event = gEvent()
         self._repository_transaction_daemon = None
-        self._repository_transaction_daemon_exit = 0
         self._cluster_daemon = None
-        self._cluster_daemon_exit = 0
         Server.__init__(self, heartbeat=self.heartbeat)
         try:
 
@@ -206,7 +205,7 @@ class Node(Server):
         try:
             if not self.remote_nodes[uid]:
                 logger.error("node(%s) is offline." % uid)
-                logger.info("try connect node(%s)" % uid)
+                logger.warning("try connect node(%s)" % uid)
                 node = self._db_session.query(Nodes).get(uid)
                 c, info = self._connect_node(json.loads(node.ipaddresses))
                 if c:
@@ -229,16 +228,20 @@ class Node(Server):
                     self.have_voted = False
                     self._repository_ready = False
                 else:
-                    self._srcr_status["ready"][uid] = self.remote_nodes[
-                        uid].info()["transaction_ready"]
+                    try:
+                        self._srcr_status["ready"][uid] = self.remote_nodes[
+                            uid].info()["transaction_ready"]
+                    except RemoteError as e:
+                        logger.warning(
+                            "Failed to send a heartbeat to node(%s): %s"
+                            % (uid, e)
+                        )
         except (LostRemote, TimeoutExpired) as e:
             self.remote_nodes[uid].close()
             self.remote_nodes[uid] = None
             if uid in self._srcr_status:
                 self._srcr_status["ready"].pop(uid)
             logger.error("connect node(%s) failed: \n%s" % (uid, e))
-        except RemoteError as e:
-            logger.error("node(%s) remote error: \n%s" % (uid, e))
         return
 
     @check_params
@@ -356,10 +359,11 @@ class Node(Server):
 
     def _check_join_node(self):
         logger.info("Check the added nodes.")
-        for _node in deepcopy(self.join_nodes):
-            self.join_nodes.remove(_node)
+        join_nodes = deepcopy(self.join_nodes)
+        self.join_nodes = []
+        for _node in join_nodes:
             if not self.remote_nodes.get(_node["sys_uid"], None):
-                logger.info("try connect node(%s)" % _node)
+                logger.warning("try connect node(%s)" % _node)
                 c = self._connect_node(_node["ipaddresses"])[0]
                 if c:
                     self.remote_nodes[_node["sys_uid"]] = c
@@ -700,8 +704,8 @@ class Node(Server):
         while tid >= roll_id:
             if tid in self.repository_transaction:
                 ta = self.repository_transaction[tid]
-                self._rollback_transaction(ta)
-                self._delete_transaction(ta)
+                self._task_pool.spawn(self._rollback_transaction, ta).join()
+                self._task_pool.spawn(self._delete_transaction, ta).join()
             tid -= 1
         logger.info("Transaction rollback completed.")
         for tid in xrange(roll_id, leader_info["transaction_id"]):
@@ -727,13 +731,10 @@ class Node(Server):
         """
         logger.info("watch kv")
         while 1:
-            if not self._repository_transaction_ready:
-                sleep(self.timeout)
-                continue
-            if self._repository_transaction_daemon_exit:
-                logger.warning("repository transaction daemon exit.")
-                return
             self._repository_transaction_event.wait()
+            if not self._repository_transaction_ready:
+                sleep(self.heartbeat)
+                continue
             logger.debug("Get transaction event.")
             try:
                 ac = deepcopy(
@@ -767,7 +768,9 @@ class Node(Server):
                                 "node(%s) will add transactions: \n%s" %
                                 (uid, ac)
                             )
-                            if rpc.append_repository_transaction(**ac):
+                            if self._task_pool.spawn(
+                                    rpc.append_repository_transaction, **ac
+                            ).get():
                                 success += 1
                             else:
                                 logger.error(
@@ -798,7 +801,9 @@ class Node(Server):
                                 "The transaction will execute: \n%s" % ac
                             )
                             ac["state"] = "doing"
-                            self._update_transaction(**ac)
+                            self._task_pool.spawn(
+                                self._update_transaction, **ac
+                            ).join()
                             self._repository_ready = True
                             logger.debug("Transaction synchronization success.")
                         else:
@@ -824,11 +829,13 @@ class Node(Server):
                     ac["state"] = "failed"
                     logger.error("Transaction execution failre: \n%s" % e)
                     try:
-                        self._rollback_transaction(ac)
+                        self._task_pool.spawn(
+                            self._rollback_transaction, ac
+                        ).join()
                     except Exception as e:
                         logger.error("Rollback transaction failre: \n%s" % e)
                 finally:
-                    self._update_transaction(**ac)
+                    self._task_pool.spawn(self._update_transaction, **ac).join()
 
                 if self.role == 0:
                     for uid, rpc in self.remote_nodes.items():
@@ -845,7 +852,9 @@ class Node(Server):
                             )
                             if ac["state"] == "committed":
                                 ac["state"] = "doing"
-                            rpc.update_transaction(**ac)
+                            self._task_pool.spawn(
+                                rpc.update_transaction, **ac
+                            ).join()
                             logger.debug(
                                 "Transaction synchronization update success.")
                         except Exception as e:
@@ -865,20 +874,16 @@ class Node(Server):
         logger.info("connect remote nodes.")
         if self._config.get("nodes", []):
             ipaddresses = self._config.get("nodes")
-            self._save_nodes(ipaddresses)
-            self._join_remote_nodes()
+            self._task_pool.spawn(self._save_nodes, ipaddresses).join()
         if self._config.get("scan", False):
             self._config["scan"] = False
             CONF[__package__] = self._config
-            self._find_remote_nodes()
-            self._join_remote_nodes()
+            self._task_pool.spawn(self._find_remote_nodes).join()
+        self._task_pool.spawn(self._join_remote_nodes).join()
         logger.info("remote nodes: %s" % self.remote_nodes)
         logger.info("watch cluster")
         keepalive_g_stat = dict()
         while 1:
-            if self._cluster_daemon_exit:
-                logger.warning("cluster daemon exit.")
-                return
             if self.join_nodes:
                 self._task_pool.spawn(self._check_join_node)
 
@@ -903,8 +908,7 @@ class Node(Server):
                         logger.info(
                             "Starts synchronizing transactions from leader."
                         )
-                        _g = self._task_pool.spawn(self._sync_transaction)
-                        _g.join()
+                        self._task_pool.spawn(self._sync_transaction).join()
                         logger.info("Transaction synchronization success!")
                         CONF["_%s_ready" % __name__] = True
                         self._repository_transaction_ready = True
@@ -951,69 +955,78 @@ class Node(Server):
                     getattr(self, ac.action)(*args)
                 except Exception as e:
                     logger.error("transaction(%s) exception: %s" % (ac.id, e))
-            if ac.state == "doing":
+            if ac.state in ("doing", "ready"):
                 action["state"] = "failed"
                 self._update_transaction(**action)
             self.repository_transaction_id = ac.id + 1
         self._repository_transaction_ready = True
 
-        self._cluster_daemon_exit = 0
         self._cluster_daemon = spawn(self._watch_cluster)
         self._repository_transaction_daemon = spawn(self._watch_kv)
-        self._repository_transaction_daemon_exit = 0
+        logger.debug("acceptor task start.")
         self._acceptor_task = spawn(self._acceptor)
-        while 1:
-            sleep(1)
-            if self._acceptor_task.ready():
-                _exc_info = "".join(
-                    format_exception(*self._acceptor_task.exc_info)
-                )
-                if _exc_info:
-                    logger.error(
-                        "acceptor task exits unexpectedly: %s" % _exc_info
+        try:
+            while 1:
+                sleep(1)
+                if self._acceptor_task.ready():
+                    _exc_info = "".join(
+                        format_exception(*self._acceptor_task.exc_info)
                     )
-                else:
-                    logger.info("acceptor task exit.")
-                break
-            if self._cluster_daemon.ready():
-                _exc_info = "".join(
-                    format_exception(*self._cluster_daemon.exc_info)
-                )
-                if _exc_info:
-                    logger.error(
-                        "cluster_daemon task exits unexpectedly: %s" % _exc_info
+                    if _exc_info:
+                        logger.error(
+                            "acceptor task exits unexpectedly:\n%s" % _exc_info
+                        )
+                    else:
+                        logger.info("acceptor task exit.")
+                    break
+                if self._cluster_daemon.ready():
+                    _exc_info = "".join(
+                        format_exception(*self._cluster_daemon.exc_info)
                     )
-                else:
-                    logger.info("cluster_daemon exit.")
-                break
-            if self._repository_transaction_daemon.ready():
-                _exc_info = "".join(
-                    format_exception(
-                        *self._repository_transaction_daemon.exc_info
+                    if _exc_info:
+                        logger.error(
+                            "cluster_daemon task exits unexpectedly:\n%s"
+                            % _exc_info
+                        )
+                    else:
+                        logger.info("cluster_daemon exit.")
+                    break
+                if self._repository_transaction_daemon.ready():
+                    _exc_info = "".join(
+                        format_exception(
+                            *self._repository_transaction_daemon.exc_info
+                        )
                     )
-                )
-                if _exc_info:
-                    logger.error(
-                        "repository_transaction_daemon exits unexpectedly: %s"
-                        % _exc_info
-                    )
-                else:
-                    logger.info("repository transaction daemon exit.")
-                break
-        self.stop()
-        self._task_pool.join(raise_error=True)
+                    if _exc_info:
+                        logger.error(
+                            "repository_transaction_daemon exits unexpectedly:"
+                            "\n%s" % _exc_info
+                        )
+                    else:
+                        logger.info("repository transaction daemon exit.")
+                    break
+        finally:
+            self.stop()
+            self._task_pool.join(raise_error=True)
 
     def stop(self, ):
         logger.warning("node server stop.")
-        if self._repository_transaction_daemon:
-            self._repository_transaction_daemon_exit = 1
-            self._repository_transaction_daemon.join()
-        if self._cluster_daemon:
-            self._cluster_daemon_exit = 1
-            self._cluster_daemon.join()
-        if self._acceptor_task is not None:
-            self._acceptor_task.kill()
-            self._acceptor_task = None
+        for name, rpc in self.remote_nodes.items():
+            logger.info("rpc of %s close." % name)
+            rpc.close()
+
+        for g in ("_acceptor_task", "_cluster_daemon",
+                  "_repository_transaction_daemon"):
+            gi = getattr(self, g)
+            if gi is not None:
+                try:
+                    gi.kill()
+                except Exception:
+                    logger.error(
+                        "\n%s" % "".join(format_exception(*sys.exc_info()))
+                    )
+                setattr(self, g, None)
+        return
 
 
 def proc():
@@ -1023,15 +1036,15 @@ def proc():
     port = config.get("port")
     node.bind("tcp://0.0.0.0:%s" % port)
     node.bind("ipc://%s" % SRkvLocalSock)
+    server = Greenlet(node.run)
 
     def exit_proc(signum=None, frame=None):
         if os.getpid() == my_pid:
             logger.warning("server exit")
-            node.stop()
             node.close()
         return
 
     signal.signal(signal.SIGINT, exit_proc)
     logger.info("SRkv server start")
-    server = spawn(node.run)
-    server.join()
+    server.start()
+    wait([server])

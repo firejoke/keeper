@@ -7,13 +7,13 @@ keeper:
   backupCount: 6
  procs:
   - name: protect_document
-    reload_max: 10
+    reload_max: -1
   - name: sync_hosts
-    reload_max: 10
+    reload_max: -1
   - name: sync_sshkey
-    reload_max: 10
+    reload_max: -1
   - name: review_galera
-    reload_max: 10
+    reload_max: -1
 #  - name: module name
 #    reload_max: 10
 #    requires:
