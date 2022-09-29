@@ -27,10 +27,6 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from invoke import Responder, UnexpectedExit, run
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from zerorpc import Client, RemoteError
 
 import MySQLdb
 
@@ -109,9 +105,6 @@ __sr_default_heartbeat = 150 * (10 ** -3)
 __sr_base_timeout = 1
 
 db_url = "sqlite:///%s" % os.path.join(root_path, ".keeper.db")
-db_engine = create_engine(db_url)
-ModelBase = declarative_base()
-Session = sessionmaker(bind=db_engine)
 SRkvLocalSock = os.path.join(root_path, "srkv.sock")
 SRkvNodeRole = {
     0: "Leader",
@@ -170,23 +163,6 @@ elif PYV == 2:
             ConfigParser.ConfigParser.add_section(self, section)
 
     encoding_type = unicode
-
-
-class RpcClient(Client):
-    def __init__(self, *args, **kwargs):
-        Client.__init__(self, *args, **kwargs)
-        self._base_method = get_base_methods(RpcClient, self)
-
-    def __call__(self, method, *args, **kwargs):
-        if not method.startswith("_") and method not in self._base_method:
-            encrypt_args = encrypt_obj(
-                {
-                    "args": args,
-                    "kwargs": kwargs
-                }
-            )
-            return decrypt_text(Client.__call__(self, method, encrypt_args))
-        return Client.__call__(self, method, *args, **kwargs)
 
 
 class ColorFormatter(logging.Formatter):
@@ -381,16 +357,22 @@ LOGGING = {
         "debug": {
             "()": ColorFormatter,
             "format": "%(asctime)s %(levelname)s %(name)s "
-                      "%(pathname)s[%(funcName)s:%(lineno)d] - %(message)s"
+                      "[%(processName)s(%(process)d):"
+                      "%(threadName)s(%(thread)d)] "
+                      "%(pathname)s[%(funcName)s:%(lineno)d] - "
+                      "%(message)s"
         },
         "verbose": {
             "()": ColorFormatter,
-            "format": "%(asctime)s %(levelname)s %(module)s %(lineno)d "
+            "format": "%(asctime)s %(levelname)s %(name)s "
+                      "%(module)s [%(funcName)s:%(lineno)d] "
                       "- %(message)s"
         },
         "simple": {
             "()": ColorFormatter,
-            "format": "%(asctime)s %(levelname)s - %(message)s"
+            "format": "%(asctime)s %(levelname)s %(name)s "
+                      "%(module)s [%(funcName)s] "
+                      "- %(message)s"
         },
     },
     "handlers": {
@@ -413,7 +395,8 @@ LOGGING = {
             "filename": os.path.join(__log_dir, "zerorpc.log"),
             "class": "logging.handlers.RotatingFileHandler",
             "maxBytes": 100 * 1024 * 1024,
-            "formatter": "debug",
+            "backupCount": 6,
+            "formatter": "debug" if __log_level == "DEBUG" else "verbose",
         },
         "srkv": {
             "level": __log_level,
@@ -475,6 +458,12 @@ logger = get_logger()
 logger.debug("Proxy object pid: %s" % manager._process.pid)
 if __load_message:
     logger.error(__load_message)
+
+
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from zerorpc import Client, RemoteError
 
 
 def flush_conf():
@@ -711,3 +700,23 @@ def sql_execute(user, password, port, sql):
     #     return None, msg
     finally:
         db.close()
+
+class RpcClient(Client):
+    def __init__(self, *args, **kwargs):
+        Client.__init__(self, *args, **kwargs)
+        self._base_method = get_base_methods(RpcClient, self)
+
+    def __call__(self, method, *args, **kwargs):
+        if not method.startswith("_") and method not in self._base_method:
+            encrypt_args = encrypt_obj(
+                {
+                    "args": args,
+                    "kwargs": kwargs
+                }
+            )
+            return decrypt_text(Client.__call__(self, method, encrypt_args))
+        return Client.__call__(self, method, *args, **kwargs)
+
+db_engine = create_engine(db_url)
+ModelBase = declarative_base()
+Session = sessionmaker(bind=db_engine)
