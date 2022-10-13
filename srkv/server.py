@@ -9,6 +9,7 @@ import signal
 from collections import Iterator, Mapping, OrderedDict, Sequence, Set
 from functools import wraps
 from logging import getLogger
+from uuid import uuid4
 
 import os
 from copy import deepcopy, copy
@@ -26,7 +27,8 @@ from zerorpc import (
 
 from models import Nodes, Repository, Transaction
 from public_def import (
-    CONF, RpcClient, SRkvLocalSock, SRkvNodeRole, Session,
+    CONF, RpcClient, SRkvLocalSock, SRkvNodeRole, SRkvTransactionLogSize,
+    SRkvTransactionLoadSize, Session,
     decrypt_text, encrypt_obj, get_local_interfaces, ip_check, scan_port,
 )
 
@@ -116,12 +118,13 @@ class Node(Server):
         self._db_session = Session()
         self.repository = dict()
         self._repository_ready = False
-        self.repository_transaction = OrderedDict()
-        # 待执行的事务编号
-        self.repository_transaction_id = 0
-        self._repository_transaction_ready = False
-        self._repository_transaction_event = gEvent()
-        self._repository_transaction_daemon = None
+        self._repository_daemon = None
+        self.transaction = OrderedDict()
+        # 已执行的事务编号
+        self.transaction_id = 0
+        self._transaction_ready = False
+        self._transaction_event = gEvent()
+        self._transaction_daemon = None
         self._cluster_daemon = None
         Server.__init__(self, heartbeat=self.heartbeat)
         try:
@@ -137,9 +140,25 @@ class Node(Server):
             self._db_session.rollback()
             logger.error(e)
 
+    def _check_role(self, expected_role):
+        if self.role == 1:
+            raise RuntimeError("my role is %s" % SRkvNodeRole[self.role])
+        elif expected_role != self.role:
+            logger.error(
+                "The local node expects its role to be %s, but %s"
+                % (SRkvNodeRole[expected_role], SRkvNodeRole[self.role])
+            )
+            CONF["_%s_ready" % __name__] = False
+            self._leader = None
+            self.role = 1
+            self.have_voted = False
+            return False
+        else:
+            return True
+
     def _check_transaction_ready(self):
         now = time()
-        while not self._repository_transaction_ready:
+        while not self._transaction_ready:
             if time() - now <= self.base_timeout:
                 sleep(max(1, self.heartbeat / 2.0))
             else:
@@ -172,8 +191,8 @@ class Node(Server):
             "have_voted": self.have_voted,
             "votes": self.votes,
             "remote_nodes": self.remote_nodes.keys(),
-            "transaction_id": self.repository_transaction_id,
-            "transaction_ready": self._repository_transaction_ready
+            "transaction_id": self.transaction_id,
+            "transaction_ready": self._transaction_ready
         }
 
     @check_params
@@ -182,14 +201,14 @@ class Node(Server):
         if leader_uid == self.leader_uid:
             self.leader_keepalive = True
             return leader_uid
-        elif not self.role == 1:
+        elif self.role == 1:
             return None
         elif (
-                self.role == 2 and
+                self.role == 2 and leader_uid != self.leader_uid and
                 leader_transaction_id > self._leader.info()["transaction_id"]
         ) or (
                 self.role == 0 and
-                leader_transaction_id > self.repository_transaction_id
+                leader_transaction_id > self.transaction_id
         ):
             self.leader_keepalive = False
             self._leader = None
@@ -215,7 +234,7 @@ class Node(Server):
                     logger.error("connection to node(%s) failed" % uid)
             else:
                 node_leader = self.remote_nodes[uid].keepalive(
-                    self.sys_uid, self.repository_transaction_id
+                    self.sys_uid, self.transaction_id
                 )
                 if node_leader and node_leader != self.sys_uid:
                     logger.warning(
@@ -250,7 +269,7 @@ class Node(Server):
         if self.role == 2:
             _transaction_max_id = self._leader.info()["transaction_id"]
         else:
-            _transaction_max_id = self.repository_transaction_id
+            _transaction_max_id = self.transaction_id
         if transaction_id > _transaction_max_id or (
                 transaction_id == _transaction_max_id and
                 node_term_counter >= self.term_counter
@@ -261,11 +280,13 @@ class Node(Server):
             self.term_counter += 1
             self._leader = self.remote_nodes[node_uid]
             self.leader_uid = node_uid
-            logger.info("my leader: %s" % self.leader_uid)
+            logger.info("My leader: %s" % self.leader_uid)
+            logger.info("My role changes from %s to follower"
+                        % SRkvNodeRole[self.role])
             self.role = 2
             self.votes[node_uid] = 1
             self._repository_ready = False
-            self._repository_transaction_ready = False
+            self._transaction_ready = False
             return node_uid
         return self.leader_uid
 
@@ -281,7 +302,7 @@ class Node(Server):
             try:
                 node_leader = self.remote_nodes[_uid].vote(
                     self.sys_uid, self.term_counter,
-                    self.repository_transaction_id
+                    self.transaction_id
                 )
                 logger.info("node(%s) of leader: %s" % (_uid, node_leader))
                 if node_leader in self.votes:
@@ -336,14 +357,14 @@ class Node(Server):
                 self.role = 0
                 self._leader = self
                 self._repository_ready = True
-                self._repository_transaction_ready = True
+                self._transaction_ready = True
                 CONF["_%s_ready" % __name__] = True
             else:
                 self.role = 2
                 self._leader = self.remote_nodes[self.leader_uid]
                 self.leader_keepalive = True
                 self._repository_ready = False
-                self._repository_transaction_ready = False
+                self._transaction_ready = False
 
         return True
 
@@ -474,24 +495,23 @@ class Node(Server):
         self._save_nodes(ipaddresses)
 
     def _create_to_repository(self, key, value):
-        self.repository[key] = value
+        self.repository[key] = self._save_repository(key, value)
 
     @check_params
     @encrypt_result
     def create_kv(self, key, value):
         self._check_repository_ready()
-        self._check_transaction_ready()
         if self.role == 1:
             RuntimeError("Node not ready.")
         elif self.role == 2:
             return self._leader.create_kv(key, value)
         else:
-            self._check_srcr()
+            self._check_transaction_ready()
             if key in self.repository:
                 return False
             self._repository_ready = False
             ac = {
-                "id": self.repository_transaction_id,
+                "id": self.transaction_id + 1,
                 "action": "_create_to_repository",
                 "key": key,
                 "value": value,
@@ -499,32 +519,31 @@ class Node(Server):
                 "roll_value": None,
                 "state": "ready",
             }
-            _ac = self._save_transaction(**ac)
-            if _ac:
-                self.repository_transaction[ac["id"]] = ac
-                self._repository_transaction_event.set()
+            ac = self._task_pool.spawn(self._save_transaction, **ac).get()
+            if ac:
+                self.transaction[ac["id"]] = ac
+                self._transaction_event.set()
                 return True
             return False
 
     def _update_to_repository(self, key, value):
-        self.repository[key] = value
+        self.repository[key] = self._update_repository(key, value)
 
     @check_params
     @encrypt_result
     def update_kv(self, key, value):
         self._check_repository_ready()
-        self._check_transaction_ready()
         if self.role == 1:
             RuntimeError("Node not ready.")
         elif self.role == 2:
             return self._leader.update_kv(key, value)
         else:
-            self._check_srcr()
+            self._check_transaction_ready()
             if key not in self.repository:
                 return False
             self._repository_ready = False
             ac = {
-                "id": self.repository_transaction_id,
+                "id": self.transaction_id + 1,
                 "action": "_update_to_repository",
                 "key": key,
                 "value": value,
@@ -532,32 +551,32 @@ class Node(Server):
                 "roll_value": self._get_from_repository(key),
                 "state": "ready",
             }
-            _ac = self._save_transaction(**ac)
-            if _ac:
-                self.repository_transaction[ac["id"]] = ac
-                self._repository_transaction_event.set()
+            ac = self._task_pool.spawn(self._save_transaction, **ac).get()
+            if ac:
+                self.transaction[ac["id"]] = ac
+                self._transaction_event.set()
                 return True
             return False
 
     def _delete_from_repository(self, key):
+        self._delete_repository(key)
         self.repository.pop(key)
 
     @check_params
     @encrypt_result
     def delete_kv(self, key):
         self._check_repository_ready()
-        self._check_transaction_ready()
         if self.role == 1:
             RuntimeError("Node not ready.")
         elif self.role == 2:
             return self._leader.delete_kv(key)
         else:
-            self._check_srcr()
+            self._check_transaction_ready()
             if key not in self.repository:
                 return False
             self._repository_ready = False
             ac = {
-                "id": self.repository_transaction_id,
+                "id": self.transaction_id + 1,
                 "action": "_delete_from_repository",
                 "key": key,
                 "value": None,
@@ -565,10 +584,10 @@ class Node(Server):
                 "roll_value": None,
                 "state": "ready",
             }
-            _ac = self._save_transaction(**ac)
-            if _ac:
-                self.repository_transaction[ac["id"]] = ac
-                self._repository_transaction_event.set()
+            ac = self._task_pool.spawn(self._save_transaction, **ac).get()
+            if ac:
+                self.transaction[ac["id"]] = ac
+                self._transaction_event.set()
                 return True
             return False
 
@@ -584,71 +603,166 @@ class Node(Server):
     @encrypt_result
     def get_kv(self, key, prefix=False):
         self._check_repository_ready()
-        self._check_transaction_ready()
         if self.role == 1:
             RuntimeError("Node is not ready")
         elif self.role == 2:
             return self._leader.get_kv(key, prefix=prefix)
         else:
-            self._check_srcr()
+            self._check_transaction_ready()
             return self._get_from_repository(key, prefix)
 
+    @z_stream
     @check_params
-    @encrypt_result
-    def get_repository_transaction(self, id):
-        self._check_transaction_ready()
-        return self.repository_transaction[id]
+    @encrypt_stream
+    def get_repository(self):
+        return self.repository
 
-    @check_params
-    @encrypt_result
-    def append_repository_transaction(self, **transaction):
-        self._check_transaction_ready()
-        if self.repository_transaction_id - 1 < transaction["id"]:
-            if self.role == 2:
-                _ac = self._save_transaction(**transaction)
-                if _ac:
-                    logger.debug(transaction)
-                    self.repository_transaction[transaction["id"]] = transaction
-                    self._repository_transaction_event.set()
-                else:
-                    raise RuntimeError("save transaction failed.")
-            elif self.role == 0:
-                CONF["_%s_ready" % __name__] = False
-                self._leader = None
-                self.role = 1
-                self.have_voted = False
-            return True
-        elif self.repository_transaction_id - 1 == transaction["id"]:
-            CONF["_%s_ready" % __name__] = False
-            self._leader = None
-            self.role = 1
-            self.have_voted = False
-            return False
-        else:
-            return False
+    def _get_repository_from_leader(self):
+        self._repository_ready = False
+        old_keys = self.repository.keys()
+        for k, v in self._task_pool.spawn(self._leader.get_repository).get():
+            if k in old_keys:
+                old_keys.remove(k)
+                self.repository.update({k: v})
+                self._task_pool.spawn(self._update_repository, k, v).join()
+            elif k not in old_keys:
+                self.repository[k] = v
+                self._task_pool.spawn(self._save_repository, k, v).join()
+        for k in old_keys:
+            self.repository.pop(k)
+            self._task_pool.spawn(self._delete_repository, k).join()
+        self._repository_ready = True
 
-    def _save_transaction(self, **kwargs):
-        logger.debug("save transaction:\n%s" % kwargs)
+    def _save_repository(self, key, value):
+        logger.debug("save repository:\n%s: %s" % (key, value))
         try:
-            ac = Transaction(**kwargs)
+            kv = Repository(key=key, value=value)
+            self._db_session.add(kv)
+            self._db_session.commit()
+            return value
+        except SQLAlchemyError as e:
+            self._db_session.rollback()
+            logger.error("save repository(%s=%s) failed:\n%s" % (key, value, e))
+            raise e
+
+    def _update_repository(self, key, value):
+        logger.debug("update repository:\n%s: %s" % (key, value))
+        try:
+            kv = self._db_session.query(Repository).get(key)
+            if not kv:
+                logger.error("kv(%s) not found." % key)
+                return False
+            old_kv ={key: kv.value}
+            logger.debug("update repository, old:\n%s" % old_kv)
+            kv.value = value
+            self._db_session.commit()
+            return value
+        except SQLAlchemyError as e:
+            self._db_session.rollback()
+            logger.error(
+                "update repository(%s=%s) failed:\n%s" % (key, value, e)
+            )
+            raise e
+
+    def _delete_repository(self, key):
+        logger.debug("delete %s from repository" % key)
+        try:
+            kv = self._db_session.query(Repository).get(key)
+            if kv:
+                self._db_session.delete(kv)
+                self._db_session.commit()
+                return True
+            else:
+                logger.error("%s not in repository." % key)
+                return False
+        except SQLAlchemyError as e:
+            self._db_session.rollback()
+            logger.error("delete %s from repository failed:\n%s" % (key, e))
+
+    @check_params
+    @encrypt_result
+    def get_transaction_uuid(self, id):
+        if self.role != 0:
+            self._check_repository_ready()
+        return self.transaction[id]["uuid"]
+
+    @check_params
+    @encrypt_result
+    def get_transaction(self, id):
+        if self.role != 0:
+            self._check_transaction_ready()
+        return self.transaction[id]
+
+    @check_params
+    @encrypt_result
+    def append_transaction(self, **transaction):
+        if not self._check_role(2):
+            return False
+        self._check_transaction_ready()
+        if transaction["id"] - self.transaction_id > 1:
+            CONF["_%s_ready" % __name__] = False
+            self._transaction_ready = False
+            logger.debug(
+                "Transaction id: %d, local transaction id: %d" %
+                (transaction["id"], self.transaction_id)
+            )
+            raise RuntimeError("Local transactions are not synchronized.")
+
+        elif transaction["id"] - self.transaction_id == 1:
+            _ac = self._task_pool.spawn(
+                self._save_transaction, **transaction
+            ).get()
+            if _ac:
+                logger.debug(
+                    "Append transaction from leader:\n%s" % transaction
+                )
+                self.transaction[transaction["id"]] = transaction
+                self._transaction_event.set()
+                return True
+            else:
+                raise RuntimeError("save transaction failed.")
+        elif transaction["id"] - self.transaction_id < 1:
+            return False
+
+    def _save_transaction(self, **transaction):
+        try:
+            if "uuid" not in transaction:
+                transaction.update(uuid=uuid4().hex)
+            logger.debug("save transaction:\n%s" % transaction)
+            ac = Transaction(**transaction)
             self._db_session.add(ac)
             self._db_session.commit()
-            return ac
-        except Exception as e:
-            logger.error("save transaction failed: \n%s\n%s" % (kwargs, e))
-            return False
+            return transaction
+        except SQLAlchemyError as e:
+            self._db_session.rollback()
+            logger.error("save transaction failed:\n%s\n%s" % (transaction, e))
+            raise e
 
     @check_params
     @encrypt_result
     def update_transaction(self, **transaction):
-        self._check_transaction_ready()
-        logger.debug("Update transaction: %s" % transaction)
-        if transaction["id"] in self.repository_transaction:
-            self.repository_transaction[transaction["id"]] = transaction
-            self._repository_transaction_event.set()
-            return True
-        else:
+        if not self._check_role(2):
             return False
+        self._check_transaction_ready()
+        if transaction["id"] < self.transaction_id + 1:
+            return False
+        elif transaction["id"] == self.transaction_id + 1:
+            if transaction["uuid"] == \
+                    self.transaction[transaction["id"]]["uuid"]:
+                logger.debug("Update transaction: %s" % transaction)
+                self.transaction[transaction["id"]] = transaction
+                self._transaction_event.set()
+                return True
+            else:
+                return False
+        else:
+            self._transaction_ready = False
+            CONF["_%s_ready" % __name__] = False
+            logger.debug(
+                "Transaction id: %d, local transaction id: %d" %
+                (transaction["id"], self.transaction_id)
+            )
+            raise RuntimeError("Local transactions are not synchronized")
 
     def _update_transaction(self, **transaction):
         logger.debug("new:\n%s" % transaction)
@@ -657,13 +771,23 @@ class Node(Server):
             if not ac:
                 logger.error("transaction not found: %s" % transaction)
                 return False
-            logger.debug("update transaction, old:\n%s" % ac.__dict__)
+            old_transaction = {
+                "id": ac.id,
+                "action": ac.action,
+                "key": ac.key,
+                "value": ac.value,
+                "roll_action": ac.roll_action,
+                "roll_value": ac.roll_value,
+                "state": ac.state,
+                "uuid": ac.uuid,
+            }
+            logger.debug("update transaction, old:\n%s" % old_transaction)
             for key, value in transaction.items():
-                if getattr(ac, key) != value:
+                if old_transaction[key] != value:
                     setattr(ac, key, value)
             self._db_session.commit()
-            self.repository_transaction[transaction["id"]] = transaction
-            self._repository_transaction_event.set()
+            self.transaction[transaction["id"]] = transaction
+            self._transaction_event.set()
             return True
         except SQLAlchemyError as e:
             self._db_session.rollback()
@@ -672,21 +796,30 @@ class Node(Server):
             )
             raise e
 
-    def _delete_transaction(self, transaction):
-        ac = self._db_session.query(Transaction).get(transaction["id"])
-        if ac:
-            logger.debug("transaction delete: %s" % ac.__dict__)
-            self._db_session.delete(ac)
-            self._db_session.commit()
-        else:
-            logger.debug("transaction not exists: %s" % transaction)
+    def _delete_transaction(self, transaction_id):
+        logger.debug("delete transaction(%s)" % transaction_id)
+        try:
+            ac = self._db_session.query(Transaction).get(transaction_id)
+            if ac:
+                self._db_session.delete(ac)
+                self._db_session.commit()
+                return True
+            else:
+                logger.debug("transaction(%s) not exists" % transaction_id)
+                return False
+        except SQLAlchemyError as e:
+            self._db_session.rollback()
+            logger.error("Transaction delete failed:\n%s" % e)
 
     def _rollback_transaction(self, transaction):
         if transaction["roll_action"] != "_delete_from_repository":
             args = (transaction["key"], transaction["roll_value"])
         else:
             args = (transaction["key"],)
-        getattr(self, transaction["roll_action"])(*args)
+        try:
+            getattr(self, transaction["roll_action"])(*args)
+        except Exception as e:
+            logger.error("Transaction rollback failed: %s" % e)
 
     def _sync_transaction(self):
         self._repository_transaction_event.clear()
@@ -731,25 +864,30 @@ class Node(Server):
         """
         logger.info("watch kv")
         while 1:
-            self._repository_transaction_event.wait()
-            if not self._repository_transaction_ready:
+            self._transaction_event.wait()
+            if not self._transaction_ready:
                 sleep(self.heartbeat)
                 continue
             logger.debug("Get transaction event.")
             try:
+                self._repository_ready = False
                 ac = deepcopy(
-                    self.repository_transaction[self.repository_transaction_id]
+                    self.transaction[
+                        self.transaction_id + 1]
                 )
                 logger.debug("transaction : %s" % ac)
-                self._repository_ready = False
             except KeyError:
-                logger.debug("No new transactions yet.")
-                self._repository_transaction_event.clear()
+                self._repository_ready = True
+                logger.debug(
+                    "No new transactions yet, id %d is expected."
+                    % (self.transaction_id + 1)
+                )
+                self._transaction_event.clear()
                 continue
             sync_votes = (len(self.remote_nodes.keys()) + 1) / 2.0
             if ac["state"] == "failed":
                 logger.warning("Transaction is in a failed state: \n%s" % ac)
-                self.repository_transaction_id += 1
+                self.transaction_id = ac["id"]
                 self._repository_ready = True
 
             elif ac["state"] == "ready":
@@ -769,7 +907,7 @@ class Node(Server):
                                 (uid, ac)
                             )
                             if self._task_pool.spawn(
-                                    rpc.append_repository_transaction, **ac
+                                    rpc.append_transaction, **ac
                             ).get():
                                 success += 1
                             else:
@@ -777,20 +915,19 @@ class Node(Server):
                                     "The transaction on node(%s) "
                                     "is relatively new" % uid
                                 )
-                                self._repository_transaction_ready = False
-                                self._repository_transaction_event.clear()
+                                self.role = 1
+                                self._transaction_ready = False
                                 CONF["_%s_ready" % __name__] = False
                                 self._leader = None
-                                self.role = 1
                                 self.have_voted = False
+                                self._transaction_event.clear()
                                 break
                         except Exception as e:
                             logger.error(
                                 "node(%s) failed to add a transaction: \n%s" %
                                 (uid, e)
                             )
-                            if isinstance(e, RemoteError) and \
-                                    "transaction is not ready" in e.msg:
+                            if isinstance(e, RemoteError):
                                 logger.error(
                                     "The transaction will not execute."
                                 )
@@ -812,8 +949,8 @@ class Node(Server):
 
                 elif self.role == 2:
                     logger.debug("transaction event: clear.")
-                    self._repository_transaction_event.clear()
-                    self._repository_ready = True
+                    self._transaction_event.clear()
+                    # self._repository_ready = True
 
             elif ac["state"] == "doing":
                 logger.debug("Execute the transaction: \n%s" % ac)
@@ -852,22 +989,32 @@ class Node(Server):
                             )
                             if ac["state"] == "committed":
                                 ac["state"] = "doing"
-                            self._task_pool.spawn(
+                            if not self._task_pool.spawn(
                                 rpc.update_transaction, **ac
-                            ).join()
+                            ).get():
+                                self.role = 1
+                                self._transaction_ready = False
+                                CONF["_%s_ready" % __name__] = False
+                                self._leader = None
+                                self.have_voted = False
+                                self._transaction_event.clear()
+                                break
                             logger.debug(
-                                "Transaction synchronization update success.")
+                                "Transaction synchronization update success."
+                            )
                         except Exception as e:
                             logger.error(
                                 "node(%s) failed to synchronizes "
                                 "the transaction: \n%s" % (uid, e)
                             )
-
-                self._repository_ready = True
+                    else:
+                        self._repository_ready = True
+                elif self.role == 2:
+                    self._repository_ready = True
 
             elif ac["state"] == "committed":
                 logger.debug("Transaction is committed: %s" % ac)
-                self.repository_transaction_id += 1
+                self.transaction_id = ac["id"]
                 self._repository_ready = True
 
     def _watch_cluster(self, ):
@@ -903,66 +1050,128 @@ class Node(Server):
                     logger.info("my role: %s" % SRkvNodeRole[self.role])
 
             elif self.role == 2:
-                if not self._repository_transaction_ready:
-                    try:
-                        logger.info(
-                            "Starts synchronizing transactions from leader."
-                        )
-                        self._task_pool.spawn(self._sync_transaction).join()
-                        logger.info("Transaction synchronization success!")
-                        CONF["_%s_ready" % __name__] = True
-                        self._repository_transaction_ready = True
-                        self._repository_ready = True
-                    except RemoteError as e:
-                        logger.error(
-                            "Transaction synchronization failed: \n%s" % e
-                        )
                 if not self.leader_keepalive:
                     self._srcr_status["ready"].pop(self.leader_uid)
+                    self.remote_nodes.pop(self.leader_uid)
                     logger.error("leader(%s) is offline!" % self.leader_uid)
                     CONF["_%s_ready" % __name__] = False
                     self._leader = None
                     self.role = 1
                     self.have_voted = False
-                    self._repository_transaction_ready = True
+                    self._transaction_ready = True
                     self._repository_ready = False
                 else:
                     self.leader_keepalive = False
                     sleep(self.timeout)
 
+    def _review_transaction(self):
+        while 1:
+            if self.role == 2 and not self._transaction_ready:
+                self._transaction_event.clear()
+                logger.info("Starts synchronizing repository from leader.")
+                self._task_pool.spawn(self._get_repository_from_leader).get()
+                logger.info("Starts synchronizing transactions from leader.")
+                leader_info = self._leader.info()
+                ltid = leader_info["transaction_id"]
+                if ltid < SRkvTransactionLoadSize:
+                    ltid_s = ltid
+                else:
+                    ltid_s = ltid - SRkvTransactionLoadSize
+                logger.info(
+                    "Retrieves transactions with ids %d through %d "
+                    "on the leader node" % (ltid_s, ltid + 1)
+                )
+                for tid in xrange(ltid_s, ltid + 1):
+                    try:
+                        lta = self._task_pool.spawn(
+                            self._leader.get_transaction, tid).get()
+                    except RemoteError as e:
+                        if e.name == "KeyError":
+                            logger.error(e.traceback)
+                        lta = None
+                    except Exception as e:
+                        logger.error(
+                            "Transaction synchronization failed: \n%s" % e
+                        )
+                        sleep(self.timeout)
+                        break
+                    ta = self.transaction.get(tid, None)
+                    if ta != lta:
+                        logger.info("transaction of leader: %s" % lta)
+                        logger.info("transaction of local: %s" % ta)
+                        if ta:
+                            self._task_pool.spawn(
+                                self._delete_transaction, tid
+                            ).join()
+                        if lta:
+                            self._task_pool.spawn(
+                                self._save_transaction, **lta
+                            )
+                        self.transaction[tid] = lta
+                    self.transaction_id = tid
+                else:
+                    logger.info("Transaction synchronization success!")
+                    self._transaction_ready = True
+                    CONF["_%s_ready" % __name__] = True
+            if not time() % (60 * 5):
+                transaction_log_size = self._task_pool.spawn(
+                    self._task_pool.spawn(
+                        self._db_session.query, Transaction.id
+                    ).get().count
+                ).get()
+                if transaction_log_size > SRkvTransactionLogSize:
+                    logger.debug(
+                        "transaction log size: %s" % transaction_log_size
+                    )
+                    min_id = self.transaction_id - SRkvTransactionLogSize
+                    for ac in self._task_pool.spawn(
+                            self._db_session.query, Transaction
+                    ).get().filter(Transaction.id <= min_id):
+                        self._delete_transaction(ac.id)
+            sleep(1)
+
     def run(self, ):
+        logger.info("Load repository.")
+        for kv in self._db_session.query(Repository):
+            logger.debug("load kv: {%s: %s}" % (kv.key, kv.value))
+            self.repository.update({kv.key: kv.value})
         logger.info("Load transaction.")
         for ac in self._db_session.query(Transaction).order_by(
                 Transaction.id
-        ).options(lazyload("*")):
-            action = {
+        ).options(lazyload("*"))[-SRkvTransactionLoadSize:]:
+            transaction = {
                 "id": ac.id,
                 "action": ac.action,
                 "key": ac.key,
                 "value": ac.value,
                 "roll_action": ac.roll_action,
                 "roll_value": ac.roll_value,
-                "state": ac.state
+                "state": ac.state,
+                "uuid": ac.uuid,
             }
-            self.repository_transaction[ac.id] = action
-            logger.debug("transaction: %s" % ac.__dict__)
-            if ac.state == "committed":
-                if ac.action != "_delete_from_repository":
-                    args = (ac.key, ac.value)
-                else:
-                    args = (ac.key,)
-                try:
-                    getattr(self, ac.action)(*args)
-                except Exception as e:
-                    logger.error("transaction(%s) exception: %s" % (ac.id, e))
-            if ac.state in ("doing", "ready"):
-                action["state"] = "failed"
-                self._update_transaction(**action)
-            self.repository_transaction_id = ac.id + 1
-        self._repository_transaction_ready = True
+            self.transaction[ac.id] = transaction
+            logger.debug("transaction: %s" % transaction)
+            if ac.action != "_delete_from_repository":
+                args = (ac.key, ac.value)
+            else:
+                args = (ac.key,)
+            try:
+                # if ac.state == "committed":
+                #     getattr(self, ac.action)(*args)
+                if ac.state in ("doing", "ready"):
+                    if ac.state == "doing":
+                        getattr(self, ac.roll_action)(*args)
+                    transaction["state"] = "failed"
+                    self._update_transaction(**transaction)
+            except Exception as e:
+                logger.error("transaction(%s) exception: %s" % (ac.id, e))
+                raise e
+            self.transaction_id = ac.id
 
+        self._transaction_ready = True
         self._cluster_daemon = spawn(self._watch_cluster)
-        self._repository_transaction_daemon = spawn(self._watch_kv)
+        self._repository_daemon = spawn(self._watch_kv)
+        self._transaction_daemon = spawn(self._review_transaction)
         logger.debug("acceptor task start.")
         self._acceptor_task = spawn(self._acceptor)
         try:
@@ -991,16 +1200,25 @@ class Node(Server):
                     else:
                         logger.info("cluster_daemon exit.")
                     break
-                if self._repository_transaction_daemon.ready():
+                if self._repository_daemon.ready():
+                    _exc_info = "".join(
+                        format_exception(*self._repository_daemon.exc_info)
+                    )
+                    if _exc_info:
+                        logger.error(
+                            "repository_daemon task exits unexpectedly:\n%s"
+                            % _exc_info
+                        )
+                if self._transaction_daemon.ready():
                     _exc_info = "".join(
                         format_exception(
-                            *self._repository_transaction_daemon.exc_info
+                            *self._transaction_daemon.exc_info
                         )
                     )
                     if _exc_info:
                         logger.error(
-                            "repository_transaction_daemon exits unexpectedly:"
-                            "\n%s" % _exc_info
+                            "transaction_daemon exits unexpectedly:\n%s"
+                            % _exc_info
                         )
                     else:
                         logger.info("repository transaction daemon exit.")
@@ -1012,11 +1230,18 @@ class Node(Server):
     def stop(self, ):
         logger.warning("node server stop.")
         for name, rpc in self.remote_nodes.items():
-            logger.info("rpc of %s close." % name)
-            rpc.close()
+            if rpc is not None:
+                logger.info("rpc of %s close." % name)
+                rpc.close()
+                self.remote_nodes.pop(name)
+
+        try:
+            self._db_session.close()
+        except Exception:
+            logger.error("\n%s" % "".join(format_exception(*sys.exc_info())))
 
         for g in ("_acceptor_task", "_cluster_daemon",
-                  "_repository_transaction_daemon"):
+                  "_repository_daemon", "_transaction_daemon"):
             gi = getattr(self, g)
             if gi is not None:
                 try:

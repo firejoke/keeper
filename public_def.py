@@ -6,7 +6,7 @@ import cPickle
 import inspect
 import logging
 import platform
-from collections import OrderedDict
+from collections import Iterator, OrderedDict
 from copy import deepcopy
 from logging.config import dictConfig
 from pwd import getpwnam
@@ -106,6 +106,8 @@ __sr_base_timeout = 1
 
 db_url = "sqlite:///%s" % os.path.join(root_path, ".keeper.db")
 SRkvLocalSock = os.path.join(root_path, "srkv.sock")
+SRkvTransactionLogSize = 100 * 100
+SRkvTransactionLoadSize = 100
 SRkvNodeRole = {
     0: "Leader",
     1: "Candidate",
@@ -714,7 +716,11 @@ class RpcClient(Client):
                     "kwargs": kwargs
                 }
             )
-            return decrypt_text(Client.__call__(self, method, encrypt_args))
+            # args = (encrypt_obj(SRKey),) + args
+            result = Client.__call__(self, method, encrypt_args)
+            if isinstance(result, Iterator):
+                return (decrypt_text(element) for element in result)
+            return decrypt_text(result)
         return Client.__call__(self, method, *args, **kwargs)
 
 db_engine = create_engine(db_url)
