@@ -16,6 +16,7 @@ from copy import deepcopy, copy
 
 from gevent import sleep, spawn, Greenlet, wait
 from gevent.event import Event as gEvent
+from gevent.hub import signal as g_signal
 from random import uniform
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -28,11 +29,16 @@ from zerorpc import (
 from models import Nodes, Repository, Transaction
 from public_def import (
     CONF, RpcClient, SRkvLocalSock, SRkvNodeRole, SRkvTransactionLogSize,
-    SRkvTransactionLoadSize, Session,
+    SRkvTransactionLoadSize, db_url,
     decrypt_text, encrypt_obj, get_local_interfaces, ip_check, scan_port,
 )
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+
+db_engine = create_engine(db_url)
+Session = sessionmaker(bind=db_engine)
 logger = getLogger(__package__)
 
 
@@ -101,6 +107,7 @@ class Node(Server):
         self.ipaddresses = list(
             self.ipaddresses - set(self._config.get("exclude_ipaddress", []))
         )
+        self.cluster_name = self._config["cluster_name"]
         self._leader = None
         self.leader_uid = None
         self.leader_keepalive = False
@@ -114,7 +121,7 @@ class Node(Server):
         self.votes = dict()
         self.remote_nodes = dict()
         self.join_nodes = list()
-        self._srcr_status = {"me": self.sys_uid, "ready": dict()}
+        self._srcr_status = {"me": self.sys_uid, "ready": dict(), "nodes": []}
         self._db_session = Session()
         self.repository = dict()
         self._repository_ready = False
@@ -174,7 +181,7 @@ class Node(Server):
             else:
                 raise RuntimeError("repository is not ready.")
 
-    def _check_srcr(self, ):
+    def _check_sr_cluster_ready(self, ):
         if not all(self._srcr_status["ready"].values()):
             raise RuntimeError("srkv cluster is not ready.")
 
@@ -192,7 +199,9 @@ class Node(Server):
             "votes": self.votes,
             "remote_nodes": self.remote_nodes.keys(),
             "transaction_id": self.transaction_id,
-            "transaction_ready": self._transaction_ready
+            "transaction_ready": self._transaction_ready,
+            "cluster_name": self.cluster_name,
+            "repository_ready": self._repository_ready
         }
 
     @check_params
@@ -281,8 +290,9 @@ class Node(Server):
             self._leader = self.remote_nodes[node_uid]
             self.leader_uid = node_uid
             logger.info("My leader: %s" % self.leader_uid)
-            logger.info("My role changes from %s to follower"
-                        % SRkvNodeRole[self.role])
+            logger.info(
+                "My role changes from %s to follower" % SRkvNodeRole[self.role]
+            )
             self.role = 2
             self.votes[node_uid] = 1
             self._repository_ready = False
@@ -370,8 +380,11 @@ class Node(Server):
 
     @check_params
     @encrypt_result
-    def echo(self, node_uid, node_ipaddress):
-        if not self.remote_nodes.get(node_uid, None):
+    def echo(self, node_uid, node_ipaddress, cluster_name):
+        if cluster_name != self.cluster_name:
+            raise RuntimeError("The cluster names do not match.")
+        if node_uid != self.sys_uid \
+                and not self.remote_nodes.get(node_uid, None):
             self.join_nodes.append(
                 {"sys_uid": node_uid, "ipaddresses": node_ipaddress}
             )
@@ -383,7 +396,8 @@ class Node(Server):
         join_nodes = deepcopy(self.join_nodes)
         self.join_nodes = []
         for _node in join_nodes:
-            if not self.remote_nodes.get(_node["sys_uid"], None):
+            if _node["sys_uid"] != self.sys_uid \
+                    and not self.remote_nodes.get(_node["sys_uid"], None):
                 logger.warning("try connect node(%s)" % _node)
                 c = self._connect_node(_node["ipaddresses"])[0]
                 if c:
@@ -455,11 +469,13 @@ class Node(Server):
                     continue
                 try:
                     if info["sys_uid"] in exists_uids:
+                        _node = self._db_session.query(Nodes).get(
+                            info["sys_uid"])
+                        if _node.ipaddresses == info["ipaddresses"]:
+                            continue
                         logger.info(
                             "update node(%s): %s" % (info["sys_uid"], info)
                         )
-                        _node = self._db_session.query(Nodes).get(
-                            info["sys_uid"])
                         _node.ipaddresses = json.dumps(
                             [ip] + json.loads(_node.ipaddresses)
                         )
@@ -474,6 +490,7 @@ class Node(Server):
                             ipaddresses=json.dumps(info["ipaddresses"]),
                         )
                         self._db_session.add(_node)
+                        exists_uids.append(info["sys_uid"])
                     self._db_session.commit()
                 except SQLAlchemyError as e:
                     self._db_session.rollback()
@@ -485,10 +502,16 @@ class Node(Server):
     def _find_remote_nodes(self):
         logger.info("scan network segment")
         ipaddresses = []
-        for ipaddress in get_local_interfaces():
+        exclude_ipaddresses = self._config.get("exclude_ipaddresses", [])
+        for ipaddress in get_local_interfaces(
+            self._config.get("require_gateway", True)
+        ):
+            if ipaddress["addr"] in exclude_ipaddresses:
+                continue
             logger.info("ipaddress: %s" % ipaddress)
             ipaddresses += scan_port(
-                    ipaddress["addr"], ipaddress["netmask"], self.rpc_port
+                ipaddress["addr"], ipaddress["netmask"], self.rpc_port,
+                exclude_ipaddresses
             )
         else:
             logger.info("The scan is complete.")
@@ -652,7 +675,7 @@ class Node(Server):
             if not kv:
                 logger.error("kv(%s) not found." % key)
                 return False
-            old_kv ={key: kv.value}
+            old_kv = {key: kv.value}
             logger.debug("update repository, old:\n%s" % old_kv)
             kv.value = value
             self._db_session.commit()
@@ -820,34 +843,6 @@ class Node(Server):
             getattr(self, transaction["roll_action"])(*args)
         except Exception as e:
             logger.error("Transaction rollback failed: %s" % e)
-
-    def _sync_transaction(self):
-        self._repository_transaction_event.clear()
-        leader_info = self._leader.info()
-        logger.info("Check for differences ......")
-        for tid in xrange(0, leader_info["transaction_id"]):
-            ta = self._leader.get_repository_transaction(tid)
-            if self.repository_transaction.get(tid, None) != ta:
-                roll_id = tid
-                break
-        else:
-            roll_id = self.repository_transaction_id
-        logger.info("rollback id: %s" % roll_id)
-        tid = self.repository_transaction_id - 1
-        while tid >= roll_id:
-            if tid in self.repository_transaction:
-                ta = self.repository_transaction[tid]
-                self._task_pool.spawn(self._rollback_transaction, ta).join()
-                self._task_pool.spawn(self._delete_transaction, ta).join()
-            tid -= 1
-        logger.info("Transaction rollback completed.")
-        for tid in xrange(roll_id, leader_info["transaction_id"]):
-            ta = self._leader.get_repository_transaction(tid)
-            if ta["state"] in ("committed", "failed"):
-                self._save_transaction(**ta)
-                self.repository_transaction[tid] = ta
-        logger.info("Transaction saved.")
-        return True
 
     def _watch_kv(self, ):
         """
@@ -1043,15 +1038,19 @@ class Node(Server):
                 sleep(self.heartbeat)
 
             elif self.role == 1:
+                logger.warning("sleep %s" % self.timeout)
+                sleep(self.timeout)
                 if not self._election():
-                    logger.warning("sleep %s" % self.timeout)
-                    sleep(self.timeout)
+                    logger.warning(
+                        "Unsuccessful election, waiting for the next round"
+                    )
                 else:
                     logger.info("my role: %s" % SRkvNodeRole[self.role])
 
             elif self.role == 2:
                 if not self.leader_keepalive:
                     self._srcr_status["ready"].pop(self.leader_uid)
+                    self.remote_nodes[self.leader_uid].close()
                     self.remote_nodes.pop(self.leader_uid)
                     logger.error("leader(%s) is offline!" % self.leader_uid)
                     CONF["_%s_ready" % __name__] = False
@@ -1076,7 +1075,7 @@ class Node(Server):
                 if ltid < SRkvTransactionLoadSize:
                     ltid_s = ltid
                 else:
-                    ltid_s = ltid - SRkvTransactionLoadSize
+                    ltid_s = ltid - (SRkvTransactionLoadSize - 1)
                 logger.info(
                     "Retrieves transactions with ids %d through %d "
                     "on the leader node" % (ltid_s, ltid + 1)
@@ -1084,7 +1083,8 @@ class Node(Server):
                 for tid in xrange(ltid_s, ltid + 1):
                     try:
                         lta = self._task_pool.spawn(
-                            self._leader.get_transaction, tid).get()
+                            self._leader.get_transaction, tid
+                        ).get()
                     except RemoteError as e:
                         if e.name == "KeyError":
                             logger.error(e.traceback)
@@ -1240,8 +1240,10 @@ class Node(Server):
         except Exception:
             logger.error("\n%s" % "".join(format_exception(*sys.exc_info())))
 
-        for g in ("_acceptor_task", "_cluster_daemon",
-                  "_repository_daemon", "_transaction_daemon"):
+        for g in (
+                "_acceptor_task", "_cluster_daemon", "_repository_daemon",
+                "_transaction_daemon"
+        ):
             gi = getattr(self, g)
             if gi is not None:
                 try:
@@ -1263,13 +1265,13 @@ def proc():
     node.bind("ipc://%s" % SRkvLocalSock)
     server = Greenlet(node.run)
 
-    def exit_proc(signum=None, frame=None):
+    def exit_proc(*args, **kwargs):
         if os.getpid() == my_pid:
             logger.warning("server exit")
             node.close()
         return
 
-    signal.signal(signal.SIGINT, exit_proc)
+    g_signal(signal.SIGINT, exit_proc)
     logger.info("SRkv server start")
     server.start()
     wait([server])

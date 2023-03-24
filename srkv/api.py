@@ -22,8 +22,8 @@ class API(object):
     def delete_kv(self, key):
         return self.rpc_client.delete_kv(key)
 
-    def get_kv(self, key):
-        return self.rpc_client.get_kv(key)
+    def get_kv(self, key, prefix=False):
+        return self.rpc_client.get_kv(key, prefix=prefix)
 
     def close(self):
         self.rpc_client.close()
