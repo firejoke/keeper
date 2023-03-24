@@ -117,7 +117,6 @@ if __name__ == '__main__':
 
     signal.signal(signal.SIGINT, exit_procs)
     while 1:
-        time.sleep(1)
         if os.path.exists(configuration_path) \
                 and old_conf_stat != os.stat(configuration_path):
             logger.warning('keeper.yaml already change')
@@ -179,5 +178,6 @@ if __name__ == '__main__':
         if not any(alive_state):
             logger.error("all sub process exit")
             break
+        time.sleep(1)
     logger.info("Service exit")
     sys.exit(signal.SIGINT)
