@@ -12,6 +12,7 @@ from logging.config import dictConfig
 from pwd import getpwnam
 from socket import AF_INET, SOCK_STREAM, socket, SHUT_RDWR
 from threading import Lock, Thread
+from ConfigParser import ConfigParser, NoOptionError, NoSectionError
 
 import ipaddress
 import netifaces
@@ -21,6 +22,7 @@ import stat
 import sys
 from multiprocessing import Manager, get_logger
 
+import psutil
 import yaml
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.backends import default_backend
@@ -99,6 +101,12 @@ fernet = Fernet(
         )
     )
 )
+LOG_DIR = "/var/log/keeper/"
+LOG_PROCS = os.path.join(LOG_DIR, "procs/")
+if not os.path.exists(LOG_DIR):
+    os.mkdir(LOG_DIR)
+if not os.path.exists(LOG_PROCS):
+    os.mkdir(LOG_PROCS)
 
 __sr_default_port = 666
 __sr_default_heartbeat = 150 * (10 ** -3)
@@ -115,56 +123,33 @@ SRkvNodeRole = {
 }
 
 
-if PYV == 3:
-    from configparser import ConfigParser, NoOptionError, NoSectionError
+class Config(ConfigParser):
 
-    class Config(ConfigParser):
+    def read(self, filenames):
+        logger.info("read %s" % filenames)
+        return super(Config, self).read(filenames)
 
-        def optionxform(self, optionstr):
-            return optionstr
+    def optionxform(self, optionstr):
+        return optionstr
 
-        def set(self, section, option, value=None):
-            logger.info("set %s=%s for %s" % (option, value, section))
-            super(Config, self).set(section, option, value)
+    def set(self, section, option, value=None):
+        logger.info("set %s=%s for %s" % (option, value, section))
+        super(Config, self).set(section, option, value)
 
-        def remove_option(self, section, option):
-            logger.warning("remove %s for %s" % (option, section))
-            super(Config, self).remove_option(section, option)
+    def remove_option(self, section, option):
+        logger.warning("remove %s for %s" % (option, section))
+        super(Config, self).remove_option(section, option)
 
-        def remove_section(self, section):
-            logger.warning("remove section: %s" % section)
-            super(Config, self).remove_section(section)
+    def remove_section(self, section):
+        logger.warning("remove section: %s" % section)
+        super(Config, self).remove_section(section)
 
-        def add_section(self, section):
-            logger.info('add section: %s' % section)
-            super(Config, self).add_section(section)
+    def add_section(self, section):
+        logger.info('add section: %s' % section)
+        super(Config, self).add_section(section)
 
-    encoding_type = str
-elif PYV == 2:
-    from ConfigParser import ConfigParser, NoOptionError, NoSectionError
 
-    class Config(ConfigParser):
-
-        def optionxform(self, optionstr):
-            return optionstr
-
-        def set(self, section, option, value=None):
-            logger.info("set %s=%s for %s" % (option, value, section))
-            ConfigParser.ConfigParser.set(self, section, option, value)
-
-        def remove_option(self, section, option):
-            logger.warning("remove %s for %s" % (option, section))
-            ConfigParser.ConfigParser.remove_option(self, section, option)
-
-        def remove_section(self, section):
-            logger.warning("remove section: %s" % section)
-            ConfigParser.ConfigParser.remove_section(self, section)
-
-        def add_section(self, section):
-            logger.info('add section: %s' % section)
-            ConfigParser.ConfigParser.add_section(self, section)
-
-    encoding_type = unicode
+encoding_type = unicode
 
 
 class ColorFormatter(logging.Formatter):
@@ -266,33 +251,20 @@ def load_conf():
             conf = dict()
         default = conf.get("keeper", dict())
         srkv = conf.get("srkv", dict())
-        alter_key = default.get('alter_key', None)
-        if alter_key:
-            try:
-                alter_key = fernet.decrypt(bytes(alter_key))
-            except InvalidToken:
-                pass
-        if CONF.items() and alter_key != 'keeper':
-            return 'alter key error'
         CONF.update(conf)
         log = default.get("logging", dict())
         if not log:
             log = {
                 "level": "INFO",
-                "dir": "/var/log/keeper/",
-                "when": "W0",
+                "max": 10,
                 "backupCount": 6,
             }
             default["logging"] = log
         elif not isinstance(log, dict):
             raise RuntimeError("Logging configuration type error, must be dict")
-        elif set(log) != {"level", "dir", "when", "backupCount"}:
+        elif set(log) != {"level", "max", "backupCount"}:
             raise RuntimeError("Logging configuration keys error.")
 
-        if not os.path.exists(log["dir"]):
-            os.mkdir(log["dir"])
-        if not os.path.exists(os.path.join(log["dir"], "procs")):
-            os.mkdir(os.path.join(log["dir"], "procs"))
         if log["level"] and log["level"].lower() not in (
                 "info", "warn", "debug", "error"):
             message = 'LOG_Level value is invalid, will be set "WARN"'
@@ -349,9 +321,7 @@ def load_conf():
 
 
 __load_message = load_conf()
-__log_level = CONF["keeper"]["logging"]["level"]
-__log_dir = CONF["keeper"]["logging"]["dir"]
-__procs_log_dir = os.path.join(__log_dir, "procs")
+LOG_LEVEL = CONF["keeper"]["logging"]["level"]
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -379,74 +349,74 @@ LOGGING = {
     },
     "handlers": {
         "root": {
-            "level": __log_level,
-            "filename": os.path.join(__log_dir, "keeper.log"),
+            "level": LOG_LEVEL,
+            "filename": os.path.join(LOG_DIR, "keeper.log"),
         },
         "console": {
-            "level": __log_level,
+            "level": LOG_LEVEL,
             "class": "logging.StreamHandler",
             "formatter": "verbose",
         },
         "sql": {
-            "level": __log_level,
-            "filename": os.path.join(__log_dir, "sql.log"),
+            "level": LOG_LEVEL,
+            "filename": os.path.join(LOG_DIR, "sql.log"),
         },
         "zerorpc": {
             "mixin": False,
-            "level": __log_level,
-            "filename": os.path.join(__log_dir, "zerorpc.log"),
+            "level": LOG_LEVEL,
+            "filename": os.path.join(LOG_DIR, "zerorpc.log"),
             "class": "logging.handlers.RotatingFileHandler",
-            "maxBytes": 100 * 1024 * 1024,
+            "maxBytes": 10 * 1024 * 1024,
             "backupCount": 6,
-            "formatter": "debug" if __log_level == "DEBUG" else "verbose",
+            "formatter": "debug" if LOG_LEVEL == "DEBUG" else "verbose",
         },
         "srkv": {
-            "level": __log_level,
-            "filename": os.path.join(__log_dir, "srkv.log"),
+            "level": LOG_LEVEL,
+            "filename": os.path.join(LOG_DIR, "srkv.log"),
         },
     },
     "loggers": {
         "root": {
             "handlers": ["root"],
-            "level": __log_level
+            "level": LOG_LEVEL
         },
         "multiprocessing": {
             "handlers": ["root"],
-            "level": __log_level
+            "level": LOG_LEVEL
         },
         "sqlalchemy": {
             "handlers": ["sql"],
-            "level": __log_level
+            "level": LOG_LEVEL
         },
         "alembic": {
             "handlers": ["console", "sql"],
-            "level": __log_level
+            "level": LOG_LEVEL
         },
         "zerorpc": {
             "handlers": ["zerorpc"],
-            "level": __log_level
+            "level": LOG_LEVEL
         },
         "srkv": {
             "handlers": ["srkv"],
-            "level": __log_level
+            "level": LOG_LEVEL
         },
     },
 }
 
 for proc in CONF["supervisory"].get("procs"):
     LOGGING["handlers"][proc["name"]] = {
-        "level": __log_level,
-        "filename": os.path.join(__procs_log_dir, "%s.log" % proc["name"])
+        "level": LOG_LEVEL,
+        "filename": os.path.join(LOG_PROCS, "%s.log" % proc["name"])
     }
     LOGGING["loggers"][proc["name"]] = {
         "handlers": [proc["name"]],
-        "level": __log_level
+        "level": LOG_LEVEL
     }
 __file_handler_mixin = {
-            "class": "logging.handlers.TimedRotatingFileHandler",
-            "when": CONF["keeper"]["logging"]["when"],
+            "class": "logging.handlers.RotatingFileHandler",
+            "maxBytes": CONF["keeper"]["logging"]["max"] * 1024 * 1024,
             "backupCount": CONF["keeper"]["logging"]["backupCount"],
-            "formatter": "debug" if __log_level == "DEBUG" else "verbose",
+            "formatter": "debug" if LOG_LEVEL == "DEBUG" else "verbose",
         }
 for name, handler in LOGGING["handlers"].items():
     if "filename" in handler:
@@ -471,7 +441,6 @@ from zerorpc import Client, RemoteError
 def flush_conf():
     global CONF
     _d = deepcopy(CONF)
-    _d["keeper"]['alter_key'] = None
     for k in _d.keys():
         if k.startswith("_") and k.endswith("ready"):
             logger.debug("conf pop %s" % k)
@@ -609,22 +578,47 @@ def read_hosts():
     return hs, 0
 
 
-def get_host_ip(hostname, hosts):
-    host_ip = ""
-    for _ip, hs in hosts.items():
-        if hs[0] == hostname:
-            host_ip = _ip
-    return host_ip
+def get_host_addr(hostname):
+    default_gateway = netifaces.gateways()["default"][netifaces.AF_INET]
+    ns = [
+        addr['addr']
+        for addr in netifaces.ifaddresses(default_gateway[1])[netifaces.AF_INET]
+        if addr['addr'] in socket.gethostbyname_ex(hostname)[2]
+        and ipaddress.ip_address(default_gateway[0])
+        in ipaddress.ip_interface(
+            "%s/%s" % (addr['addr'], addr['netmask'])
+        ).network
+    ]
+    return ns
 
 
-def get_local_interfaces():
+def get_local_interfaces(require_gateway=False):
+    # get ipaddresses
+    gateway = dict()
     interfaces = []
-    for _if in netifaces.interfaces():
+    if require_gateway:
+        for _if in netifaces.gateways().get(netifaces.AF_INET):
+            if _if[1] not in gateway:
+                gateway[_if[1]] = []
+            gateway[_if[1]].append(_if[0])
+        ifs = gateway.keys()
+    else:
+        ifs = netifaces.interfaces()
+    for _if in ifs:
         if not _if.startswith("virbr"):
             for _ip in netifaces.ifaddresses(_if).get(netifaces.AF_INET,
                                                       tuple()):
                 if _ip.get("addr") not in (None, "127.0.0.1"):
-                    interfaces.append(_ip)
+                    if require_gateway:
+                        _ip_network = ipaddress.ip_network(
+                            "%s/%s" % (_ip.get("addr"), _ip.get("netmask")),
+                            strict=False
+                        )
+                        for g in gateway[_if]:
+                            if ipaddress.ip_address(g) in _ip_network:
+                                interfaces.append(_ip)
+                    else:
+                        interfaces.append(_ip)
     return interfaces
 
 
@@ -645,7 +639,7 @@ def check_port(port, ipaddres="127.0.0.1", timeout=0.1):
         s.close()
 
 
-def scan_port(network_segment, netmask, port):
+def scan_port(network_segment, netmask, port, exclude=None):
     # prefix_len = netmask.rstrip(".0").split(".").__len__()
     # prefix = ".".join(network_segment.split(".")[:prefix_len])
     # _ips = [prefix]
@@ -655,6 +649,10 @@ def scan_port(network_segment, netmask, port):
     #         for e in range(256):
     #             pl.append("%s.%s" % (p, e))
     #     _ips = pl
+    if not exclude:
+        exclude = list()
+    if not isinstance(exclude, (list, tuple, set)):
+        raise TypeError("exclude must be a list.")
     logger.debug(
         "network segment: %s, netmask: %s, port: %s" %
         (network_segment, netmask, port)
@@ -677,6 +675,8 @@ def scan_port(network_segment, netmask, port):
     for _ip in ipaddress.ip_network(
             "%s/%s" % (network_segment, netmask), strict=False
     ).hosts():
+        if _ip in exclude:
+            continue
         if i == 65535:
             i = 1
         logger.debug("try connect %s" % _ip)
@@ -703,6 +703,15 @@ def sql_execute(user, password, port, sql):
     finally:
         db.close()
 
+
+def query_process(name):
+    for p in psutil.process_iter(["pid", "name", "cmdline"]):
+        _info = p.info
+        if _info["name"] == name:
+            return _info
+    return None
+
+
 class RpcClient(Client):
     def __init__(self, *args, **kwargs):
         Client.__init__(self, *args, **kwargs)
@@ -723,6 +732,5 @@ class RpcClient(Client):
             return decrypt_text(result)
         return Client.__call__(self, method, *args, **kwargs)
 
-db_engine = create_engine(db_url)
+
 ModelBase = declarative_base()
-Session = sessionmaker(bind=db_engine)

@@ -2,8 +2,7 @@ keeper:
  alter_key: null
  logging:
   level: debug
-  dir: /var/log/keeper/
-  when: W0
+  max: 10
   backupCount: 6
  procs:
   - name: protect_document
@@ -25,7 +24,7 @@ srkv:
  timeout: 3
  scan: true
  nodes: []
- exclude_ipaddress: []
+ exclude_ipaddresses: []
 
 protect_document:
  documents: []
