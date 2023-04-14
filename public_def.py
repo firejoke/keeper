@@ -10,7 +10,7 @@ from collections import Iterator, OrderedDict
 from copy import deepcopy
 from logging.config import dictConfig
 from pwd import getpwnam
-from socket import AF_INET, SOCK_STREAM, socket, SHUT_RDWR
+from socket import AF_INET, SOCK_STREAM, socket, SHUT_RDWR, gethostbyname_ex
 from threading import Lock, Thread
 from ConfigParser import ConfigParser, NoOptionError, NoSectionError
 
@@ -127,26 +127,26 @@ class Config(ConfigParser):
 
     def read(self, filenames):
         logger.info("read %s" % filenames)
-        return super(Config, self).read(filenames)
+        return ConfigParser.read(self, filenames)
 
     def optionxform(self, optionstr):
         return optionstr
 
     def set(self, section, option, value=None):
         logger.info("set %s=%s for %s" % (option, value, section))
-        super(Config, self).set(section, option, value)
+        ConfigParser.set(self, section, option, value)
 
     def remove_option(self, section, option):
         logger.warning("remove %s for %s" % (option, section))
-        super(Config, self).remove_option(section, option)
+        ConfigParser.remove_option(self, section, option)
 
     def remove_section(self, section):
         logger.warning("remove section: %s" % section)
-        super(Config, self).remove_section(section)
+        ConfigParser.remove_section(self, section)
 
     def add_section(self, section):
         logger.info('add section: %s' % section)
-        super(Config, self).add_section(section)
+        ConfigParser.add_section(self, section)
 
 
 encoding_type = unicode
@@ -283,7 +283,8 @@ def load_conf():
         CONF["keeper"] = default
         # srkv config
         if not set(srkv.keys()) <= {
-            "heartbeat", "port", "timeout", "scan", "nodes", "exclude_ipaddress"
+            "heartbeat", "port", "timeout", "scan", "nodes",
+            "exclude_ipaddresses"
         }:
             raise RuntimeError("srkv configuration error")
         if "port" not in srkv:
@@ -403,7 +404,7 @@ LOGGING = {
     },
 }
 
-for proc in CONF["supervisory"].get("procs"):
+for proc in CONF["keeper"].get("procs"):
     LOGGING["handlers"][proc["name"]] = {
         "level": LOG_LEVEL,
         "filename": os.path.join(LOG_PROCS, "%s.log" % proc["name"])
@@ -583,7 +584,7 @@ def get_host_addr(hostname):
     ns = [
         addr['addr']
         for addr in netifaces.ifaddresses(default_gateway[1])[netifaces.AF_INET]
-        if addr['addr'] in socket.gethostbyname_ex(hostname)[2]
+        if addr['addr'] in gethostbyname_ex(hostname)[2]
         and ipaddress.ip_address(default_gateway[0])
         in ipaddress.ip_interface(
             "%s/%s" % (addr['addr'], addr['netmask'])

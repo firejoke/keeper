@@ -30,7 +30,8 @@ from models import Nodes, Repository, Transaction
 from public_def import (
     CONF, RpcClient, SRkvLocalSock, SRkvNodeRole, SRkvTransactionLogSize,
     SRkvTransactionLoadSize, db_url,
-    decrypt_text, encrypt_obj, get_local_interfaces, ip_check, scan_port,
+    decrypt_text, encrypt_obj, get_local_interfaces, ip_check, root_path,
+    scan_port,
 )
 
 from sqlalchemy import create_engine
@@ -99,8 +100,14 @@ class Node(Server):
    """
     ipaddresses = {_ip["addr"] for _ip in get_local_interfaces()}
 
-    with open("/sys/class/dmi/id/product_uuid") as f:
-        sys_uid = f.read().strip()
+    uuid_path = os.path.join(root_path, ".sys_uid")
+    if not os.path.exists(uuid_path):
+        sys_uid = str(uuid4())
+        with open(uuid_path, "w") as f:
+            f.write(sys_uid)
+    else:
+        with open(uuid_path) as f:
+            sys_uid = f.read().strip()
 
     def __init__(self, config):
         self._config = config
@@ -120,7 +127,8 @@ class Node(Server):
         self.rpc_port = self._config["port"]
         self.votes = dict()
         self.remote_nodes = dict()
-        self.join_nodes = list()
+        self.join_nodes = dict()
+        self._check_join_node_status = False
         self._srcr_status = {"me": self.sys_uid, "ready": dict(), "nodes": []}
         self._db_session = Session()
         self.repository = dict()
@@ -167,7 +175,7 @@ class Node(Server):
         now = time()
         while not self._transaction_ready:
             if time() - now <= self.base_timeout:
-                sleep(max(1, self.heartbeat / 2.0))
+                sleep(0.1)
             else:
                 raise RuntimeError("transaction is not ready.")
         else:
@@ -177,7 +185,7 @@ class Node(Server):
         now = time()
         while not self._repository_ready:
             if time() - now <= self.base_timeout:
-                sleep(max(1, self.heartbeat / 2.0))
+                sleep(0.1)
             else:
                 raise RuntimeError("repository is not ready.")
 
@@ -188,7 +196,7 @@ class Node(Server):
     @check_params
     @encrypt_result
     def info(self):
-        self._check_transaction_ready()
+        # self._check_transaction_ready()
         return {
             "sys_uid": self.sys_uid,
             "leader": self.leader_uid,
@@ -209,6 +217,9 @@ class Node(Server):
     def keepalive(self, leader_uid, leader_transaction_id):
         if leader_uid == self.leader_uid:
             self.leader_keepalive = True
+            if leader_transaction_id > self.transaction_id:
+                self._transaction_ready = False
+                CONF["_%s_ready" % __name__] = False
             return leader_uid
         elif self.role == 1:
             return None
@@ -238,7 +249,8 @@ class Node(Server):
                 c, info = self._connect_node(json.loads(node.ipaddresses))
                 if c:
                     self.remote_nodes[uid] = c
-                    self._srcr_status["ready"][uid] = False
+                    self._srcr_status["ready"][uid] = c.info()[
+                        "transaction_ready"]
                 else:
                     logger.error("connection to node(%s) failed" % uid)
             else:
@@ -268,7 +280,7 @@ class Node(Server):
             self.remote_nodes[uid].close()
             self.remote_nodes[uid] = None
             if uid in self._srcr_status:
-                self._srcr_status["ready"].pop(uid)
+                self._srcr_status["ready"][uid] = False
             logger.error("connect node(%s) failed: \n%s" % (uid, e))
         return
 
@@ -297,6 +309,7 @@ class Node(Server):
             self.votes[node_uid] = 1
             self._repository_ready = False
             self._transaction_ready = False
+            CONF["_%s_ready" % __name__] = False
             return node_uid
         return self.leader_uid
 
@@ -308,6 +321,10 @@ class Node(Server):
         self.have_voted = True
         self.votes[self.sys_uid] = 1
         for _uid in copy(self.remote_nodes.keys()):
+            if not self.remote_nodes[_uid]:
+                logger.info("The node(%s) is closed;")
+                self.remote_nodes[_uid] = None
+                continue
             logger.info("canvass votes for node(%s)" % _uid)
             try:
                 node_leader = self.remote_nodes[_uid].vote(
@@ -320,15 +337,13 @@ class Node(Server):
                 elif node_leader:
                     self.votes[node_leader] = 1
             except (LostRemote, TimeoutExpired) as e:
-                self.remote_nodes[_uid].close()
-                self.remote_nodes.pop(_uid)
-                if _uid in self._srcr_status:
-                    self._srcr_status["ready"].pop(_uid)
                 logger.error(
-                    "connect failed, "
-                    "node(%s) will be removed from remote_nodes: \n%s" %
-                    (_uid, e)
+                    "node(%s) connect failed:\n%s" % (_uid, e)
                 )
+                self.remote_nodes[_uid].close()
+                self.remote_nodes[_uid] = None
+                if _uid in self._srcr_status:
+                    self._srcr_status["ready"][_uid] = False
             except RemoteError as e:
                 logger.error("failed to canvass for node(%s): \n%s" % (_uid, e))
                 return False
@@ -338,8 +353,6 @@ class Node(Server):
         logger.info("My uid: %s" % self.sys_uid)
         if self.role == 1:
             logger.info("start election")
-            self._join_remote_nodes()
-            logger.info("remote nodes: %s" % self.remote_nodes)
             win_votes = (len(self.remote_nodes) + 1) / 2.0
             self.votes.clear()
             if not self._seek_votes():
@@ -384,45 +397,53 @@ class Node(Server):
         if cluster_name != self.cluster_name:
             raise RuntimeError("The cluster names do not match.")
         if node_uid != self.sys_uid \
-                and not self.remote_nodes.get(node_uid, None):
-            self.join_nodes.append(
-                {"sys_uid": node_uid, "ipaddresses": node_ipaddress}
-            )
+                and not self.remote_nodes.get(node_uid, None)\
+                and not self.join_nodes.get(node_uid, None):
+            self.join_nodes[node_uid] = node_ipaddress
 
         return {"sys_uid": self.sys_uid, "ipaddresses": self.ipaddresses}
 
     def _check_join_node(self):
-        logger.info("Check the added nodes.")
-        join_nodes = deepcopy(self.join_nodes)
-        self.join_nodes = []
-        for _node in join_nodes:
-            if _node["sys_uid"] != self.sys_uid \
-                    and not self.remote_nodes.get(_node["sys_uid"], None):
-                logger.warning("try connect node(%s)" % _node)
-                c = self._connect_node(_node["ipaddresses"])[0]
-                if c:
-                    self.remote_nodes[_node["sys_uid"]] = c
-                    self._srcr_status["ready"][_node["sys_uid"]] = False
-                else:
-                    self.join_nodes.append(_node)
-                    return
-            if not self._db_session.query(Nodes).get(_node["sys_uid"]):
-                try:
-                    logger.info("save node(%s) to database: %s" %
-                                (_node["sys_uid"], _node))
-                    node = Nodes(
-                        sys_uid=_node["sys_uid"],
-                        ipaddresses=json.dumps(_node["ipaddresses"])
+        self._check_join_node_status = True
+        check_nodes = []
+        for node_uid, node_ips in self.join_nodes.items():
+            if node_uid != self.sys_uid \
+                    and not self.remote_nodes.get(node_uid, None):
+                logger.warning(
+                    "try connect node(%s, %s)" % (node_uid, node_ips)
+                )
+                check_nodes.append(
+                    self._task_pool.spawn(
+                        self._connect_node, node_ips
                     )
-                    self._db_session.add(node)
-                    self._db_session.commit()
-                except SQLAlchemyError as e:
-                    self.join_nodes.append(_node)
-                    logger.error(
-                        "node(%s) save failed: \n%s" % (_node["sys_uid"], e)
-                    )
-                finally:
-                    self._db_session.rollback()
+                )
+        sleep(self.heartbeat)
+        if check_nodes:
+            logger.info("Check the added nodes.")
+        for _node in check_nodes:
+            c, info = _node.get()
+            if c:
+                self.remote_nodes[info["sys_uid"]] = c
+                self._srcr_status["ready"][info["sys_uid"]] = c.info()[
+                    "transaction_ready"]
+                self.join_nodes.pop(info)
+                if not self._db_session.query(Nodes).get(info["sys_uid"]):
+                    try:
+                        logger.info("save node(%s) to database: %s" %
+                                    (info["sys_uid"], info))
+                        node = Nodes(
+                            sys_uid=info["sys_uid"],
+                            ipaddresses=json.dumps(info["ipaddresses"])
+                        )
+                        self._db_session.add(node)
+                        self._db_session.commit()
+                    except SQLAlchemyError as e:
+                        logger.error(
+                            "node(%s) save failed: \n%s" % (info["sys_uid"], e)
+                        )
+                    finally:
+                        self._db_session.rollback()
+        self._check_join_node_status = False
 
     def _connect_node(self, ipaddresses):
         c = RpcClient(heartbeat=self.heartbeat)
@@ -434,20 +455,27 @@ class Node(Server):
                 info = c.echo(self.sys_uid, self.ipaddresses)
             except (LostRemote, TimeoutExpired, RemoteError) as e:
                 c.disconnect(_url)
-                logger.error("connect node(%s) failed: %s" % (ip, e))
+                logger.error("connect node(%s) failed:\n%s" % (ip, e))
                 continue
             else:
+                logger.info("connect node(%s) success:\n%s" % (ip, info))
                 return c, info
         c.close()
         return None, None
 
-    def _join_remote_nodes(self, ):
-        for node in self._db_session.query(Nodes).filter(
+    def _join_remote_nodes(self):
+        nodes = [
+            self._task_pool.spawn(
+                self._connect_node, json.loads(node.ipaddresses)
+            )
+            for node in self._db_session.query(Nodes).filter(
                 Nodes.sys_uid != self.sys_uid
-        ).all():
-            if self.remote_nodes.get(node.sys_uid, None):
-                continue
-            c = self._connect_node(json.loads(node.ipaddresses))[0]
+            ).all()
+            if not self.remote_nodes.get(node.sys_uid, None)
+        ]
+        sleep(self.heartbeat)
+        for node in nodes:
+            c, info = node.get()
             if c:
                 self.remote_nodes[node.sys_uid] = c
                 self._srcr_status["ready"][node.sys_uid] = False
@@ -462,11 +490,15 @@ class Node(Server):
         for n in exists_nodes:
             exists_uids.append(n[0])
             exists_ips += json.loads(n[1])
-        for ip in ipaddresses:
-            if ip_check(ip) and ip not in exists_ips:
-                c, info = self._connect_node([ip])
-                if not c:
-                    continue
+        nodes = [
+            self._task_pool.spawn(self._connect_node, [ip])
+            for ip in ipaddresses
+            if ip_check(ip) and ip not in exists_ips
+        ]
+        sleep(self.heartbeat)
+        for node in nodes:
+            c, info = node.get()
+            if c:
                 try:
                     if info["sys_uid"] in exists_uids:
                         _node = self._db_session.query(Nodes).get(
@@ -476,11 +508,9 @@ class Node(Server):
                         logger.info(
                             "update node(%s): %s" % (info["sys_uid"], info)
                         )
-                        _node.ipaddresses = json.dumps(
-                            [ip] + json.loads(_node.ipaddresses)
-                        )
+                        _node.ipaddresses = json.dumps(info["ipaddresses"])
                     else:
-                        logger.info("find remote node host: %s" % ip)
+                        logger.info("find remote node host: %s" % info)
                         logger.info(
                             "save node(%s) to database: %s" %
                             (info["sys_uid"], info)
@@ -498,6 +528,8 @@ class Node(Server):
                         "write node(%s) to database failed: %s" %
                         (info["sys_uid"], e)
                     )
+                finally:
+                    c.lose()
 
     def _find_remote_nodes(self):
         logger.info("scan network segment")
@@ -704,17 +736,17 @@ class Node(Server):
 
     @check_params
     @encrypt_result
-    def get_transaction_uuid(self, id):
+    def get_transaction_uuid(self, t_id):
         if self.role != 0:
             self._check_repository_ready()
-        return self.transaction[id]["uuid"]
+        return self.transaction[t_id]["uuid"]
 
     @check_params
     @encrypt_result
-    def get_transaction(self, id):
+    def get_transaction(self, t_id):
         if self.role != 0:
             self._check_transaction_ready()
-        return self.transaction[id]
+        return self.transaction[t_id]
 
     @check_params
     @encrypt_result
@@ -725,7 +757,7 @@ class Node(Server):
         if transaction["id"] - self.transaction_id > 1:
             CONF["_%s_ready" % __name__] = False
             self._transaction_ready = False
-            logger.debug(
+            logger.error(
                 "Transaction id: %d, local transaction id: %d" %
                 (transaction["id"], self.transaction_id)
             )
@@ -752,9 +784,11 @@ class Node(Server):
             if "uuid" not in transaction:
                 transaction.update(uuid=uuid4().hex)
             logger.debug("save transaction:\n%s" % transaction)
-            ac = Transaction(**transaction)
-            self._db_session.add(ac)
-            self._db_session.commit()
+            ac = self._db_session.query(Transaction).get(transaction["id"])
+            if not ac:
+                ac = Transaction(**transaction)
+                self._db_session.add(ac)
+                self._db_session.commit()
             return transaction
         except SQLAlchemyError as e:
             self._db_session.rollback()
@@ -774,7 +808,9 @@ class Node(Server):
                     self.transaction[transaction["id"]]["uuid"]:
                 logger.debug("Update transaction: %s" % transaction)
                 self.transaction[transaction["id"]] = transaction
-                self._transaction_event.set()
+                self._task_pool.spawn(
+                    self._update_repository, **transaction
+                ).join()
                 return True
             else:
                 return False
@@ -861,7 +897,7 @@ class Node(Server):
         while 1:
             self._transaction_event.wait()
             if not self._transaction_ready:
-                sleep(self.heartbeat)
+                sleep(1)
                 continue
             logger.debug("Get transaction event.")
             try:
@@ -879,16 +915,16 @@ class Node(Server):
                 )
                 self._transaction_event.clear()
                 continue
-            sync_votes = (len(self.remote_nodes.keys()) + 1) / 2.0
-            if ac["state"] == "failed":
-                logger.warning("Transaction is in a failed state: \n%s" % ac)
-                self.transaction_id = ac["id"]
-                self._repository_ready = True
+            sync_votes = (
+                len([node for node, rpc in self.remote_nodes.items() if rpc])
+                + 1
+            ) / 2.0
 
-            elif ac["state"] == "ready":
+            if ac["state"] == "ready":
                 logger.debug("Transaction is a ready state: \n%s" % ac)
                 if self.role == 0:
                     success = 1
+                    trans = dict()
                     for uid, rpc in self.remote_nodes.items():
                         if not rpc:
                             logger.warning(
@@ -896,14 +932,16 @@ class Node(Server):
                                 "transactions." % uid
                             )
                             continue
+                        logger.debug(
+                            "node(%s) will add transactions: \n%s" %
+                            (uid, ac)
+                        )
+                        trans[uid] = self._task_pool.spawn(
+                            rpc.append_transaction, **ac
+                        )
+                    for uid, g in trans.items():
                         try:
-                            logger.debug(
-                                "node(%s) will add transactions: \n%s" %
-                                (uid, ac)
-                            )
-                            if self._task_pool.spawn(
-                                    rpc.append_transaction, **ac
-                            ).get():
+                            if g.get():
                                 success += 1
                             else:
                                 logger.error(
@@ -911,12 +949,10 @@ class Node(Server):
                                     "is relatively new" % uid
                                 )
                                 self.role = 1
-                                self._transaction_ready = False
                                 CONF["_%s_ready" % __name__] = False
                                 self._leader = None
                                 self.have_voted = False
                                 self._transaction_event.clear()
-                                break
                         except Exception as e:
                             logger.error(
                                 "node(%s) failed to add a transaction: \n%s" %
@@ -926,7 +962,6 @@ class Node(Server):
                                 logger.error(
                                     "The transaction will not execute."
                                 )
-                                break
                     else:
                         if success >= sync_votes:
                             logger.debug(
@@ -969,7 +1004,10 @@ class Node(Server):
                 finally:
                     self._task_pool.spawn(self._update_transaction, **ac).join()
 
+            elif ac["state"] in ("committed", "failed"):
+                logger.debug("Transaction is %s: %s" % (ac["state"], ac))
                 if self.role == 0:
+                    trans = dict()
                     for uid, rpc in self.remote_nodes.items():
                         if not rpc:
                             logger.warning(
@@ -977,18 +1015,19 @@ class Node(Server):
                                 "transactions." % uid
                             )
                             continue
+                        if ac["state"] == "committed":
+                            ac["state"] = "doing"
+                        logger.debug(
+                            "node(%s) synchronizes update the "
+                            "transactions: \n%s" % (uid, ac)
+                        )
+                        trans[uid] = self._task_pool.spawn(
+                            rpc.update_transaction, **ac
+                        )
+                    for uid, g in trans.items():
                         try:
-                            logger.debug(
-                                "node(%s) synchronizes update the "
-                                "transactions: \n%s" % (uid, ac)
-                            )
-                            if ac["state"] == "committed":
-                                ac["state"] = "doing"
-                            if not self._task_pool.spawn(
-                                rpc.update_transaction, **ac
-                            ).get():
+                            if not g.get():
                                 self.role = 1
-                                self._transaction_ready = False
                                 CONF["_%s_ready" % __name__] = False
                                 self._leader = None
                                 self.have_voted = False
@@ -1004,16 +1043,11 @@ class Node(Server):
                             )
                     else:
                         self._repository_ready = True
-                elif self.role == 2:
-                    self._repository_ready = True
-
-            elif ac["state"] == "committed":
-                logger.debug("Transaction is committed: %s" % ac)
                 self.transaction_id = ac["id"]
                 self._repository_ready = True
 
     def _watch_cluster(self, ):
-        logger.info("connect remote nodes.")
+        logger.info("watch cluster")
         if self._config.get("nodes", []):
             ipaddresses = self._config.get("nodes")
             self._task_pool.spawn(self._save_nodes, ipaddresses).join()
@@ -1021,12 +1055,9 @@ class Node(Server):
             self._config["scan"] = False
             CONF[__package__] = self._config
             self._task_pool.spawn(self._find_remote_nodes).join()
-        self._task_pool.spawn(self._join_remote_nodes).join()
-        logger.info("remote nodes: %s" % self.remote_nodes)
-        logger.info("watch cluster")
         keepalive_g_stat = dict()
         while 1:
-            if self.join_nodes:
+            if self.join_nodes and not self._check_join_node_status:
                 self._task_pool.spawn(self._check_join_node)
 
             if self.role == 0:
@@ -1038,8 +1069,14 @@ class Node(Server):
                 sleep(self.heartbeat)
 
             elif self.role == 1:
+                logger.info("connect remote nodes.")
+                self._task_pool.spawn(self._join_remote_nodes).join()
+                logger.info("remote nodes: %s" % self.remote_nodes)
                 logger.warning("sleep %s" % self.timeout)
                 sleep(self.timeout)
+                if self._transaction_event.ready():
+                    logger.info("Wait for the transaction to be ready.")
+                    continue
                 if not self._election():
                     logger.warning(
                         "Unsuccessful election, waiting for the next round"
@@ -1049,21 +1086,22 @@ class Node(Server):
 
             elif self.role == 2:
                 if not self.leader_keepalive:
-                    self._srcr_status["ready"].pop(self.leader_uid)
-                    self.remote_nodes[self.leader_uid].close()
-                    self.remote_nodes.pop(self.leader_uid)
-                    logger.error("leader(%s) is offline!" % self.leader_uid)
-                    CONF["_%s_ready" % __name__] = False
+                    self._repository_ready = False
                     self._leader = None
+                    self._srcr_status["ready"][self.leader_uid] = False
+                    self.remote_nodes[self.leader_uid].close()
+                    self.remote_nodes[self.leader_uid] = None
                     self.role = 1
                     self.have_voted = False
                     self._transaction_ready = True
-                    self._repository_ready = False
+                    logger.error("leader(%s) is offline!" % self.leader_uid)
+                    CONF["_%s_ready" % __name__] = False
                 else:
                     self.leader_keepalive = False
                     sleep(self.timeout)
 
     def _review_transaction(self):
+        logger.info("Review transaction.")
         while 1:
             if self.role == 2 and not self._transaction_ready:
                 self._transaction_event.clear()
@@ -1073,7 +1111,7 @@ class Node(Server):
                 leader_info = self._leader.info()
                 ltid = leader_info["transaction_id"]
                 if ltid < SRkvTransactionLoadSize:
-                    ltid_s = ltid
+                    ltid_s = 1
                 else:
                     ltid_s = ltid - (SRkvTransactionLoadSize - 1)
                 logger.info(
@@ -1159,8 +1197,6 @@ class Node(Server):
                 # if ac.state == "committed":
                 #     getattr(self, ac.action)(*args)
                 if ac.state in ("doing", "ready"):
-                    if ac.state == "doing":
-                        getattr(self, ac.roll_action)(*args)
                     transaction["state"] = "failed"
                     self._update_transaction(**transaction)
             except Exception as e:

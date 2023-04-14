@@ -26,7 +26,7 @@ logger = getLogger(__name__)
 def connect_mysql(user, password, port):
     try:
         conn = MySQLdb.connect(
-            host="localhost", user=user, password=password, port=port,
+            host="localhost", user=user, passwd=password, port=port,
             connect_timeout=10
         )
     except Exception:
